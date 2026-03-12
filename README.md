@@ -13,9 +13,9 @@ User input (Dash UI)
 │   (query classifier) │
 └──┬──┬──┬──┬─────────┘
    │  │  │  │
-   │  │  │  └──► Nebius LLM Narrative  (services/llm_nebius.py)
-   │  │  │         cloud inference via Token Factory
-   │  │  │         ↓ fallback if no API key
+   │  │  │  └──► vLLM Narrative        (services/llm.py)
+   │  │  │         self-hosted inference (Nebius/AWS)
+   │  │  │         ↓ fallback if no endpoint
    │  │  │       Template Generator    (services/narrative.py)
    │  │  │
    │  │  └─────► FinBERT Sentiment     (services/sentiment.py)
@@ -55,28 +55,22 @@ Open http://localhost:8050 in your browser.
 | Variable | Required | Description |
 |---|---|---|
 | `TAVILY_API_KEY` | Yes (for live search) | API key from [tavily.com](https://tavily.com) |
-| `NEBIUS_API_KEY` | No | API key for Nebius Token Factory LLM inference |
+| `VLLM_ENDPOINT` | No | vLLM server URL (e.g., `http://localhost:8000`) |
+| `VLLM_API_KEY` | No | Optional API key if vLLM server requires auth |
+| `VLLM_MODEL` | No | Model name (default: `meta-llama/Llama-3.3-70B-Instruct`) |
 | `SENTIMENT_MODE` | No | `finbert` (default) or `mock` for lightweight keyword heuristic |
 
 If `TAVILY_API_KEY` is not set, the app returns mock search results and still runs.
 
 If FinBERT fails to load (e.g. no torch), the app falls back to mock sentiment automatically.
 
-## Using Nebius Token Factory
+## Using vLLM for Narrative Generation
 
-The app supports cloud LLM inference via [Nebius Token Factory](https://studio.nebius.com/) for generating rich, hedge-fund-style market narratives.
-
-### Setup
-
-1. Get an API key from [Nebius AI Studio](https://studio.nebius.com/)
-2. Add it to your `.env` file:
-   ```
-   NEBIUS_API_KEY=your_api_key_here
-   ```
+The app supports self-hosted LLM inference via [vLLM](https://github.com/vllm-project/vllm) for generating hedge-fund-style market narratives.
 
 ### How It Works
 
-When `NEBIUS_API_KEY` is set, the narrative generator uses Nebius Token Factory to call a Llama 3.3 70B model. The model receives:
+When `VLLM_ENDPOINT` is set, the narrative generator calls your vLLM server with:
 - Current price data (ticker, price, 1d/5d changes)
 - Top news headlines from Tavily search
 - Sentiment summary from FinBERT analysis
@@ -89,7 +83,69 @@ The LLM produces a structured analysis with:
 
 ### Fallback Mode
 
-If `NEBIUS_API_KEY` is not set or if the API call fails, the app automatically falls back to the built-in template-based narrative generator. This ensures the app always works, even without cloud inference.
+If `VLLM_ENDPOINT` is not set or if the API call fails, the app automatically falls back to the built-in template-based narrative generator.
+
+### Deploying vLLM on Nebius Cloud
+
+Nebius offers cost-effective GPU VMs with good H100/A100 availability.
+
+```bash
+# 1. Create a Nebius VM with GPU (e.g., 2x A100 80GB for 70B model)
+
+# 2. SSH into the VM and install vLLM
+pip install vllm
+
+# 3. Start the server
+vllm serve meta-llama/Llama-3.3-70B-Instruct \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --tensor-parallel-size 2
+
+# 4. Configure your .env
+VLLM_ENDPOINT=http://<nebius-vm-ip>:8000
+```
+
+### Deploying vLLM on AWS
+
+AWS offers p4d (A100) and p5 (H100) instances.
+
+```bash
+# 1. Launch an EC2 instance (e.g., p4d.24xlarge with 8x A100)
+
+# 2. SSH into the instance and install vLLM
+pip install vllm
+
+# 3. Start the server
+vllm serve meta-llama/Llama-3.3-70B-Instruct \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --tensor-parallel-size 2
+
+# 4. Configure your .env (use private IP if in same VPC)
+VLLM_ENDPOINT=http://<ec2-ip>:8000
+```
+
+### Using a Smaller Model
+
+For lower GPU requirements, use a smaller model:
+
+```bash
+# 8B model - fits on single A100/H100
+vllm serve meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 8000
+
+# Update .env
+VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct
+```
+
+### Cost Comparison
+
+| Provider | GPU | Approx. Cost |
+|----------|-----|--------------|
+| Nebius | 2x A100 80GB | ~$5/hr |
+| AWS | p4d.24xlarge (8x A100) | ~$32/hr |
+| AWS | p5.48xlarge (8x H100) | ~$98/hr |
+
+For a 70B model, 2x A100 80GB is sufficient. Nebius is more cost-effective for dedicated GPU workloads.
 
 ## Example Queries
 
@@ -110,7 +166,7 @@ If `NEBIUS_API_KEY` is not set or if the API call fails, the app automatically f
 │   ├── market_data.py      # yfinance price retrieval
 │   ├── sentiment.py        # FinBERT / mock sentiment
 │   ├── narrative.py        # Template-based narrative generator (fallback)
-│   └── llm_nebius.py       # Nebius Token Factory LLM integration
+│   └── llm.py              # vLLM integration (OpenAI-compatible API)
 ├── utils/
 │   └── config.py           # Env vars + constants
 ├── requirements.txt
@@ -127,5 +183,4 @@ If `NEBIUS_API_KEY` is not set or if the API call fails, the app automatically f
 - **Multi-asset correlation view** — show how moves relate across asset classes
 - **Event timeline** — chronological view of catalysts driving price action
 - **Better sentiment calibration** — fine-tune FinBERT on financial headlines, add entity-level sentiment
-- **LLM narrative upgrade** — swap template engine for Claude / GPT API for richer commentary
 - **Alerting** — scheduled runs with threshold-based notifications

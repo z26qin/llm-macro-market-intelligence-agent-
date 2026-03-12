@@ -1,9 +1,19 @@
-"""Nebius Token Factory LLM integration for narrative generation."""
+"""LLM integration for narrative generation via vLLM (OpenAI-compatible API).
+
+Supports self-hosted vLLM on:
+- Nebius Cloud VMs
+- AWS EC2 (p4d, p5 instances)
+- Any GPU infrastructure
+
+Environment variables:
+- VLLM_ENDPOINT: vLLM server URL (e.g., http://localhost:8000/v1)
+- VLLM_API_KEY: Optional API key if server requires auth
+- VLLM_MODEL: Model name (default: meta-llama/Llama-3.3-70B-Instruct)
+"""
 
 from __future__ import annotations
 
 import os
-import json
 import requests
 
 from services.market_data import PriceSnapshot
@@ -11,7 +21,15 @@ from services.search import SearchResult
 from services.sentiment import SentimentSummary
 
 
-NEBIUS_API_URL = "https://api.studio.nebius.com/v1/chat/completions"
+DEFAULT_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+
+
+def _get_endpoint() -> str:
+    """Get the vLLM endpoint URL."""
+    endpoint = os.getenv("VLLM_ENDPOINT", "").rstrip("/")
+    if endpoint and not endpoint.endswith("/v1"):
+        endpoint = f"{endpoint}/v1"
+    return endpoint
 
 
 def _format_price_data(snapshots: list[PriceSnapshot]) -> str:
@@ -76,9 +94,9 @@ Produce a short explanation with the following sections:
 Be concise and analytical."""
 
 
-def is_nebius_available() -> bool:
-    """Check if Nebius API key is configured."""
-    return bool(os.getenv("NEBIUS_API_KEY"))
+def is_llm_available() -> bool:
+    """Check if vLLM endpoint is configured."""
+    return bool(_get_endpoint())
 
 
 def generate_market_narrative(
@@ -87,7 +105,7 @@ def generate_market_narrative(
     headlines: list,
     sentiment_summary: dict,
 ) -> str:
-    """Generate a market narrative using Nebius Token Factory.
+    """Generate a market narrative using vLLM.
 
     Args:
         topic: The market topic being analyzed (e.g., "NVDA", "oil")
@@ -98,9 +116,9 @@ def generate_market_narrative(
     Returns:
         Generated narrative string from the LLM
     """
-    api_key = os.getenv("NEBIUS_API_KEY")
-    if not api_key:
-        raise ValueError("NEBIUS_API_KEY environment variable is not set")
+    endpoint = _get_endpoint()
+    if not endpoint:
+        raise ValueError("VLLM_ENDPOINT environment variable is not set")
 
     # Format inputs for the prompt
     formatted_prices = _format_price_data(price_data.get("snapshots", []))
@@ -114,13 +132,17 @@ def generate_market_narrative(
         sentiment_summary=formatted_sentiment,
     )
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
+    headers = {"Content-Type": "application/json"}
+
+    # Add auth header if API key is set
+    api_key = os.getenv("VLLM_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    model = os.getenv("VLLM_MODEL", DEFAULT_MODEL)
 
     payload = {
-        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "model": model,
         "messages": [
             {"role": "user", "content": prompt}
         ],
@@ -130,7 +152,7 @@ def generate_market_narrative(
 
     try:
         response = requests.post(
-            NEBIUS_API_URL,
+            f"{endpoint}/chat/completions",
             headers=headers,
             json=payload,
             timeout=30,
@@ -142,11 +164,11 @@ def generate_market_narrative(
         return content.strip()
 
     except requests.exceptions.Timeout:
-        raise RuntimeError("Nebius API request timed out")
+        raise RuntimeError("vLLM request timed out")
     except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Nebius API request failed: {e}")
+        raise RuntimeError(f"vLLM request failed: {e}")
     except (KeyError, IndexError) as e:
-        raise RuntimeError(f"Unexpected Nebius API response format: {e}")
+        raise RuntimeError(f"Unexpected vLLM response format: {e}")
 
 
 def generate_narrative_with_fallback(
@@ -157,7 +179,7 @@ def generate_narrative_with_fallback(
     sentiment: SentimentSummary,
     template_fallback_fn,
 ) -> str:
-    """Generate narrative using Nebius LLM, with fallback to template generator.
+    """Generate narrative using vLLM, with fallback to template generator.
 
     Args:
         topic: The query/topic being analyzed
@@ -165,12 +187,12 @@ def generate_narrative_with_fallback(
         results: Search results from Tavily
         snapshots: Price snapshots from yfinance
         sentiment: Sentiment analysis summary
-        template_fallback_fn: Fallback function to use if Nebius is unavailable
+        template_fallback_fn: Fallback function to use if vLLM is unavailable
 
     Returns:
         Generated narrative string
     """
-    if not is_nebius_available():
+    if not is_llm_available():
         return template_fallback_fn(topic, query_type, results, snapshots, sentiment)
 
     try:
@@ -182,5 +204,5 @@ def generate_narrative_with_fallback(
         )
     except Exception as e:
         # Log the error and fall back to template
-        print(f"[llm_nebius] Nebius API error: {e}. Falling back to template.")
+        print(f"[llm] vLLM error: {e}. Falling back to template.")
         return template_fallback_fn(topic, query_type, results, snapshots, sentiment)

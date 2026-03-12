@@ -9,7 +9,7 @@ from services.search import search_tavily, SearchResult
 from services.market_data import get_snapshots_for_query, PriceSnapshot
 from services.sentiment import analyze_sentiment, SentimentSummary
 from services.narrative import generate_narrative
-from services.llm_nebius import generate_narrative_with_fallback
+from services.llm import generate_narrative_with_fallback
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Orchestrator
