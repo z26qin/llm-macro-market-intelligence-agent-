@@ -19,6 +19,9 @@ def _build_search_query(query: str, query_type: str) -> str:
     templates = {
         "oil": f"why is oil price moving today {query} crude energy markets",
         "neocloud": f"{query} neocloud AI infrastructure stock market news today",
+        "crypto": f"{query} crypto bitcoin cryptocurrency market news today",
+        "ai_robotics": f"{query} AI robotics autonomous vehicles market news today",
+        "credit": f"{query} credit high yield bond HYG CDX spreads market news today",
         "ticker": f"why is {query} stock moving today market news",
         "macro": f"{query} macro market narrative today economy",
     }

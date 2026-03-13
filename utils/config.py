@@ -23,6 +23,15 @@ CRYPTO_TICKERS = ["BMNR", "MSTR", "BTC-USD"]
 
 AI_ROBOTICS_TICKERS = ["TSLA"]
 
+CREDIT_TICKERS = [
+    "HYG",   # High Yield Corporate Bond
+    "LQD",   # Investment Grade Corporate Bond
+    "JNK",   # SPDR High Yield Bond
+    "BKLN",  # Senior Loans (liquidity indicator)
+    "EMB",   # EM USD Bond
+    "TLT",   # Treasury benchmark (for spread calc)
+]
+
 # Tavily search defaults
 SEARCH_MAX_RESULTS = 8
 

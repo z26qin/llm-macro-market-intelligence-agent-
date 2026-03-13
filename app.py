@@ -6,7 +6,7 @@ import dash
 from dash import dcc, html, Input, Output, State, callback
 
 from services.search import search_tavily, SearchResult
-from services.market_data import get_snapshots_for_query, PriceSnapshot
+from services.market_data import get_snapshots_for_query, PriceSnapshot, get_credit_spreads, CreditSpread
 from services.sentiment import analyze_sentiment, SentimentSummary
 from services.narrative import generate_narrative
 from services.llm import generate_narrative_with_fallback
@@ -36,7 +36,12 @@ def run_analysis(query: str, query_type: str) -> dict:
             texts.append(r.snippet[:300])
     sentiment: SentimentSummary = analyze_sentiment(texts)
 
-    # 4. Narrative (Nebius LLM with template fallback)
+    # 4. Credit spreads (only for credit query type)
+    credit_spreads: list[CreditSpread] = []
+    if query_type == "credit":
+        credit_spreads = get_credit_spreads()
+
+    # 5. Narrative (vLLM with template fallback)
     narrative = generate_narrative_with_fallback(
         topic=query,
         query_type=query_type,
@@ -51,6 +56,8 @@ def run_analysis(query: str, query_type: str) -> dict:
         "snapshots": snapshots,
         "sentiment": sentiment,
         "narrative": narrative,
+        "credit_spreads": credit_spreads,
+        "query_type": query_type,
     }
 
 
@@ -88,6 +95,7 @@ app.layout = html.Div(
                         {"label": "NeoCloud / AI Infra", "value": "neocloud"},
                         {"label": "Crypto", "value": "crypto"},
                         {"label": "AI Robotics", "value": "ai_robotics"},
+                        {"label": "Credit", "value": "credit"},
                         {"label": "Custom Ticker", "value": "ticker"},
                         {"label": "Macro Topic", "value": "macro"},
                     ],
@@ -170,6 +178,50 @@ def _render_prices(snapshots: list[PriceSnapshot]) -> html.Div:
     ], style={"overflowX": "auto"})
 
 
+def _render_credit_spreads(spreads: list[CreditSpread]) -> html.Div:
+    """Render credit spread table."""
+    if not spreads:
+        return html.Div()
+
+    rows = []
+    for sp in spreads:
+        d1 = f"{sp.spread_1d_change:+.3f}%" if sp.spread_1d_change is not None else "—"
+        d5 = f"{sp.spread_5d_change:+.3f}%" if sp.spread_5d_change is not None else "—"
+        # Color based on interpretation
+        if "tightening" in sp.interpretation or "outperforming" in sp.interpretation or "risk-on" in sp.interpretation:
+            color = "#080"  # green = risk-on
+        elif "widening" in sp.interpretation or "underperforming" in sp.interpretation or "risk-off" in sp.interpretation or "stress" in sp.interpretation:
+            color = "#b00"  # red = risk-off
+        else:
+            color = "#888"
+        rows.append(html.Tr([
+            html.Td(sp.name, style={"fontWeight": "bold"}),
+            html.Td(f"{sp.spread:.4f}" if sp.spread else "—"),
+            html.Td(d1, style={"color": color}),
+            html.Td(d5),
+            html.Td(sp.interpretation, style={"fontSize": "11px", "color": color}),
+        ]))
+
+    header = html.Tr([
+        html.Th("Spread"),
+        html.Th("Ratio"),
+        html.Th("1d Δ"),
+        html.Th("5d Δ"),
+        html.Th("Interpretation"),
+    ])
+
+    return html.Div([
+        html.H4("Credit Spreads & Risk Appetite"),
+        html.Table([header] + rows,
+                   style={"borderCollapse": "collapse", "width": "100%",
+                          "fontSize": "13px", "textAlign": "left"}),
+        html.P("↑ Ratio = credit outperforming (spreads tightening, risk-on)",
+               style={"fontSize": "11px", "color": "#666", "marginTop": "8px"}),
+        html.P("↓ Ratio = credit underperforming (spreads widening, risk-off)",
+               style={"fontSize": "11px", "color": "#666"}),
+    ], style={"overflowX": "auto", "marginTop": "16px"})
+
+
 def _render_sentiment(sentiment: SentimentSummary) -> html.Div:
     bar_color = "#080" if sentiment.avg_score > 0 else "#b00" if sentiment.avg_score < 0 else "#888"
     return html.Div([
@@ -227,9 +279,18 @@ def on_run(n_clicks, query, query_type):
     if "error" in data:
         return html.P(data["error"], style={"color": "red"})
 
-    return html.Div([
+    # Build output components
+    components = [
         _render_prices(data["snapshots"]),
         html.Hr(),
+    ]
+
+    # Add credit spreads section if this is a credit query
+    if data.get("query_type") == "credit" and data.get("credit_spreads"):
+        components.append(_render_credit_spreads(data["credit_spreads"]))
+        components.append(html.Hr())
+
+    components.extend([
         _render_sentiment(data["sentiment"]),
         html.Hr(),
         _render_headlines(data["results"]),
@@ -238,6 +299,8 @@ def on_run(n_clicks, query, query_type):
         html.Hr(),
         _render_debug(data["results"], data["sentiment"]),
     ])
+
+    return html.Div(components)
 
 
 if __name__ == "__main__":
