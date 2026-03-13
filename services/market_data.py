@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import yfinance as yf
 
-from utils.config import OIL_TICKERS, OIL_DISPLAY, NEOCLOUD_TICKERS
+from utils.config import OIL_TICKERS, OIL_DISPLAY, NEOCLOUD_TICKERS, CRYPTO_TICKERS, AI_ROBOTICS_TICKERS
 
 
 @dataclass
@@ -69,6 +69,10 @@ def get_snapshots_for_query(query: str, query_type: str) -> list[PriceSnapshot]:
         return [get_price_snapshot(t) for t in OIL_TICKERS]
     elif query_type == "neocloud":
         return [get_price_snapshot(t) for t in NEOCLOUD_TICKERS]
+    elif query_type == "crypto":
+        return [get_price_snapshot(t) for t in CRYPTO_TICKERS]
+    elif query_type == "ai_robotics":
+        return [get_price_snapshot(t) for t in AI_ROBOTICS_TICKERS]
     elif query_type == "ticker":
         symbol = query.strip().upper()
         return [get_price_snapshot(symbol)]

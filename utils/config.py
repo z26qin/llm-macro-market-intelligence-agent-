@@ -19,6 +19,10 @@ OIL_DISPLAY = {"CL=F": "WTI Crude", "BZ=F": "Brent Crude"}
 
 NEOCLOUD_TICKERS = ["NVDA", "NBIS", "CRWV", "ORCL", "MSFT"]
 
+CRYPTO_TICKERS = ["BMNR", "MSTR", "BTC-USD"]
+
+AI_ROBOTICS_TICKERS = ["TSLA"]
+
 # Tavily search defaults
 SEARCH_MAX_RESULTS = 8
 

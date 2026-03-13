@@ -81,6 +81,8 @@ app.layout = html.Div(
                     options=[
                         {"label": "Oil", "value": "oil"},
                         {"label": "NeoCloud / AI Infra", "value": "neocloud"},
+                        {"label": "Crypto", "value": "crypto"},
+                        {"label": "AI Robotics", "value": "ai_robotics"},
                         {"label": "Custom Ticker", "value": "ticker"},
                         {"label": "Macro Topic", "value": "macro"},
                     ],
