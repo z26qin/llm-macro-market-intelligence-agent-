@@ -109,13 +109,31 @@ app.layout = html.Div(
 
 # ── Helper renderers ─────────────────────────────────────────────────────────
 
+def _format_date(date_str: str | None) -> str:
+    """Format ISO date string to readable format."""
+    if not date_str:
+        return ""
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return dt.strftime("%b %d, %Y %H:%M")
+    except Exception:
+        return date_str[:10] if date_str else ""
+
+
 def _render_headlines(results: list[SearchResult]) -> html.Div:
     items = []
     for r in results:
         link = html.A(r.title, href=r.url, target="_blank",
                        style={"color": "#1a0dab"}) if r.url else html.Span(r.title)
-        items.append(html.Li([link, html.Br(),
-                              html.Span(r.snippet[:200], style={"fontSize": "12px", "color": "#555"})]))
+        date_display = _format_date(r.published_date)
+        date_span = html.Span(f" [{date_display}]", style={"fontSize": "11px", "color": "#888"}) if date_display else None
+        items.append(html.Li([
+            link,
+            date_span,
+            html.Br(),
+            html.Span(r.snippet[:200], style={"fontSize": "12px", "color": "#555"})
+        ]))
     return html.Div([
         html.H4("Latest Headlines"),
         html.Ul(items, style={"paddingLeft": "20px", "lineHeight": "1.7"}),

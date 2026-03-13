@@ -11,6 +11,7 @@ class SearchResult:
     title: str
     url: str
     snippet: str
+    published_date: str | None = None  # ISO format date string
 
 
 def _build_search_query(query: str, query_type: str) -> str:
@@ -51,8 +52,11 @@ def search_tavily(query: str, query_type: str) -> list[SearchResult]:
                     title=r.get("title", ""),
                     url=r.get("url", ""),
                     snippet=r.get("content", "")[:500],
+                    published_date=r.get("published_date"),
                 )
             )
+        # Sort by published_date (most recent first), None dates go last
+        results.sort(key=lambda x: x.published_date or "", reverse=True)
         return results
     except Exception as e:
         print(f"[search] Tavily error: {e}")
