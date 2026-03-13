@@ -11,6 +11,7 @@ class SentimentResult:
     label: str          # positive / negative / neutral
     score: float        # confidence 0-1
     text: str           # input text
+    raw_signal: float = 0.0  # pos_score - neg_score; preserves directional lean for neutral
 
 
 @dataclass
@@ -48,10 +49,13 @@ def _run_finbert(texts: list[str]) -> list[SentimentResult]:
         truncated = text[:512]
         preds = pipe(truncated)[0]  # list of {label, score}
         best = max(preds, key=lambda p: p["score"])
+        score_map = {p["label"].lower(): p["score"] for p in preds}
+        raw_signal = score_map.get("positive", 0.0) - score_map.get("negative", 0.0)
         results.append(SentimentResult(
-            label=best["label"],
+            label=best["label"].lower(),
             score=round(best["score"], 3),
             text=truncated[:120],
+            raw_signal=round(raw_signal, 3),
         ))
     return results
 
@@ -69,12 +73,12 @@ def _run_mock(texts: list[str]) -> list[SentimentResult]:
         pos = sum(1 for w in pos_words if w in lower)
         neg = sum(1 for w in neg_words if w in lower)
         if pos > neg:
-            label, score = "positive", 0.7
+            label, score, raw_signal = "positive", 0.7, 0.7
         elif neg > pos:
-            label, score = "negative", 0.7
+            label, score, raw_signal = "negative", 0.7, -0.7
         else:
-            label, score = "neutral", 0.5
-        results.append(SentimentResult(label=label, score=score, text=text[:120]))
+            label, score, raw_signal = "neutral", 0.5, 0.0
+        results.append(SentimentResult(label=label, score=score, text=text[:120], raw_signal=raw_signal))
     return results
 
 
@@ -104,15 +108,7 @@ def analyze_sentiment(texts: list[str]) -> SentimentSummary:
     neu = sum(1 for d in details if d.label == "neutral")
 
     # Signed average: positive -> +score, negative -> -score
-    signed = []
-    for d in details:
-        if d.label == "positive":
-            signed.append(d.score)
-        elif d.label == "negative":
-            signed.append(-d.score)
-        else:
-            signed.append(0.0)
-    avg = round(sum(signed) / len(signed), 3) if signed else 0.0
+    avg = round(sum(d.raw_signal for d in details) / len(details), 3) if details else 0.0
 
     return SentimentSummary(
         avg_score=avg, positive=pos, negative=neg, neutral=neu,

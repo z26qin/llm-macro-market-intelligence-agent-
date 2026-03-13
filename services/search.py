@@ -42,17 +42,19 @@ def search_tavily(query: str, query_type: str) -> list[SearchResult]:
         response = client.search(
             query=search_query,
             max_results=SEARCH_MAX_RESULTS,
-            search_depth="basic",
+            search_depth="advanced",
             include_answer=False,
         )
         results: list[SearchResult] = []
         for r in response.get("results", []):
+            # Try both snake_case and camelCase for published date
+            pub_date = r.get("published_date") or r.get("publishedDate")
             results.append(
                 SearchResult(
                     title=r.get("title", ""),
                     url=r.get("url", ""),
                     snippet=r.get("content", "")[:500],
-                    published_date=r.get("published_date"),
+                    published_date=pub_date,
                 )
             )
         # Sort by published_date (most recent first), None dates go last

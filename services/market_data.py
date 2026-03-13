@@ -55,6 +55,7 @@ def get_price_snapshot(ticker: str) -> PriceSnapshot:
             change_1d_pct=_pct_change(close, 1),
             change_5d_pct=_pct_change(close, 5),
         )
+
     except Exception as e:
         return PriceSnapshot(
             ticker=ticker, name=ticker, price=None,

@@ -28,7 +28,12 @@ def run_analysis(query: str, query_type: str) -> dict:
     snapshots: list[PriceSnapshot] = get_snapshots_for_query(query, query_type)
 
     # 3. Sentiment on headlines + snippets
-    texts = [r.title + ". " + r.snippet for r in results if r.title]
+    texts = []
+    for r in results:
+        if r.title:
+            texts.append(r.title)
+        if r.snippet:
+            texts.append(r.snippet[:300])
     sentiment: SentimentSummary = analyze_sentiment(texts)
 
     # 4. Narrative (Nebius LLM with template fallback)
