@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import dash
-from dash import dcc, html, Input, Output, State, callback
+from dash import dcc, html, Input, Output, State, callback, dash_table
+import plotly.graph_objects as go
 
 from services.search import search_tavily, SearchResult
-from services.market_data import get_snapshots_for_query, PriceSnapshot, get_credit_spreads, CreditSpread
+from services.market_data import (
+    get_snapshots_for_query, PriceSnapshot,
+    get_credit_spreads, CreditSpread,
+    get_all_technical_snapshots, TechnicalSnapshot,
+)
 from services.sentiment import analyze_sentiment, SentimentSummary
 from services.narrative import generate_narrative
 from services.llm import generate_and_validate_narrative
 from services.validation import ValidationResult
+from services.portfolio import compute_portfolio, PositionResult
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Orchestrator
@@ -70,13 +76,9 @@ def run_analysis(query: str, query_type: str) -> dict:
 app = dash.Dash(__name__)
 app.title = "Macro Market Intelligence"
 
-app.layout = html.Div(
-    style={"fontFamily": "Menlo, Consolas, monospace", "maxWidth": "960px",
-           "margin": "0 auto", "padding": "24px"},
+analysis_tab = html.Div(
+    style={"paddingTop": "16px"},
     children=[
-        html.H2("Macro Market Intelligence Agent",
-                 style={"borderBottom": "2px solid #333", "paddingBottom": "8px"}),
-
         # ── Input row ────────────────────────────────────────────────────
         html.Div(style={"display": "flex", "gap": "12px", "alignItems": "flex-end",
                          "marginBottom": "16px"}, children=[
@@ -117,6 +119,105 @@ app.layout = html.Div(
         # ── Loading + output ─────────────────────────────────────────────
         dcc.Loading(id="loading", type="default", children=[
             html.Div(id="output-area", style={"marginTop": "12px"}),
+        ]),
+    ],
+)
+
+
+technicals_tab = html.Div(
+    style={"paddingTop": "16px"},
+    children=[
+        html.Div(style={"display": "flex", "gap": "12px", "alignItems": "center",
+                        "marginBottom": "16px"}, children=[
+            html.Button(
+                "Load Technicals", id="tech-btn",
+                style={"padding": "8px 20px", "fontSize": "14px",
+                       "cursor": "pointer", "backgroundColor": "#222",
+                       "color": "#fff", "border": "none", "borderRadius": "4px"},
+            ),
+            html.Span("Returns, Bollinger Bands (20, 2σ), RSI (14) for all tracked tickers.",
+                     style={"fontSize": "12px", "color": "#666"}),
+        ]),
+        dcc.Loading(id="tech-loading", type="default", children=[
+            html.Div(id="tech-output", style={"marginTop": "12px"}),
+        ]),
+    ],
+)
+
+
+portfolio_tab = html.Div(
+    style={"paddingTop": "16px"},
+    children=[
+        html.P("Positions are assumed entered on the first trading day of 2026 (2026-01-02). "
+               "Cash earns no return.",
+               style={"fontSize": "12px", "color": "#666", "marginBottom": "12px"}),
+
+        html.Div(style={"display": "flex", "gap": "16px", "alignItems": "flex-end",
+                        "marginBottom": "12px"}, children=[
+            html.Div(children=[
+                html.Label("Total Capital ($)", style={"fontSize": "13px", "fontWeight": "bold"}),
+                dcc.Input(
+                    id="pf-capital", type="number", value=150000, min=0, step=1000,
+                    style={"width": "160px", "padding": "8px", "fontSize": "14px"},
+                ),
+            ]),
+            html.Button(
+                "Calculate", id="pf-btn",
+                style={"padding": "8px 20px", "fontSize": "14px",
+                       "cursor": "pointer", "backgroundColor": "#222",
+                       "color": "#fff", "border": "none", "borderRadius": "4px"},
+            ),
+        ]),
+
+        html.Label("Positions", style={"fontSize": "13px", "fontWeight": "bold"}),
+        dash_table.DataTable(
+            id="pf-positions",
+            columns=[
+                {"name": "Ticker", "id": "ticker", "type": "text"},
+                {"name": "Entry Price ($)", "id": "entry_price", "type": "numeric"},
+                {"name": "Shares", "id": "shares", "type": "numeric"},
+            ],
+            data=[
+                {"ticker": "MSTR", "entry_price": 141.0, "shares": 100},
+                {"ticker": "MSTU", "entry_price": 7.0,   "shares": 1500},
+                {"ticker": "TSLA", "entry_price": 382.0, "shares": 100},
+                {"ticker": "TSLL", "entry_price": 13.0,  "shares": 2000},
+                {"ticker": "CIFR", "entry_price": 17.6,  "shares": 300},
+                {"ticker": "COHR", "entry_price": 308.0, "shares": 50},
+                {"ticker": "STRC", "entry_price": 99.0,  "shares": 200},
+                {"ticker": "IBIT", "entry_price": 50.0,  "shares": 100},
+                {"ticker": "MRAL", "entry_price": 5.0,   "shares": 2200},
+            ],
+            editable=True,
+            row_deletable=True,
+            style_cell={"fontFamily": "Menlo, monospace", "fontSize": "13px", "padding": "6px"},
+            style_header={"fontWeight": "bold", "backgroundColor": "#f0f0f0"},
+            style_table={"marginBottom": "12px"},
+        ),
+        html.Button(
+            "+ Add Row", id="pf-add-row",
+            style={"padding": "4px 12px", "fontSize": "12px", "cursor": "pointer",
+                   "marginBottom": "16px", "border": "1px solid #888",
+                   "backgroundColor": "#fff", "borderRadius": "4px"},
+        ),
+
+        dcc.Loading(id="pf-loading", type="default", children=[
+            html.Div(id="pf-output", style={"marginTop": "12px"}),
+        ]),
+    ],
+)
+
+
+app.layout = html.Div(
+    style={"fontFamily": "Menlo, Consolas, monospace", "maxWidth": "1152px",
+           "margin": "0 auto", "padding": "24px"},
+    children=[
+        html.H2("Macro Market Intelligence Agent",
+                 style={"borderBottom": "2px solid #333", "paddingBottom": "8px"}),
+        dcc.Tabs(id="main-tabs", value="analysis", children=[
+            dcc.Tab(label="Analysis", value="analysis", children=[analysis_tab]),
+            dcc.Tab(label="Technicals", value="technicals", children=[technicals_tab]),
+            dcc.Tab(label="Portfolio Construction", value="portfolio", children=[portfolio_tab]),
         ]),
     ],
 )
@@ -392,6 +493,240 @@ def on_run(n_clicks, query, query_type):
     ])
 
     return html.Div(components)
+
+
+def _render_technicals(snapshots: list[TechnicalSnapshot]) -> html.Div:
+    """Render technicals table: returns + Bollinger Bands + RSI."""
+    def _pct(v): return f"{v:+.2f}%" if v is not None else "—"
+    def _num(v): return f"{v:.2f}" if v is not None else "—"
+
+    def _rsi_color(rsi):
+        if rsi is None:
+            return "#888"
+        if rsi >= 70:
+            return "#b00"  # overbought
+        if rsi <= 30:
+            return "#080"  # oversold
+        return "#333"
+
+    def _rsi_int(v):
+        return f"{int(round(v))}" if v is not None else "—"
+
+    def _bb_cell_color(price, band_value, kind: str):
+        """Color upper red when price pierces above, lower green when price pierces below."""
+        if price is None or band_value is None:
+            return "#333"
+        if kind == "upper" and price >= band_value:
+            return "#b00"
+        if kind == "lower" and price <= band_value:
+            return "#080"
+        return "#333"
+
+    def _rvol_color(rvol):
+        if rvol is None:
+            return "#888", "normal"
+        if rvol > 2.0:
+            return "#080", "bold"   # abnormal volume — strong green
+        if rvol > 1.5:
+            return "#080", "normal"  # elevated — green
+        if rvol < 0.5:
+            return "#b00", "normal"  # unusually light
+        return "#333", "normal"
+
+    def _macd_signal_label(macd, signal, hist):
+        """Interpret MACD state for a quick read."""
+        if macd is None or signal is None or hist is None:
+            return "—", "#888"
+        # Bullish: MACD > signal (above zero = strong bullish momentum)
+        if macd > signal and macd > 0:
+            return "bullish ↑", "#080"
+        if macd > signal and macd <= 0:
+            return "recovering", "#5a5"
+        if macd < signal and macd < 0:
+            return "bearish ↓", "#b00"
+        if macd < signal and macd >= 0:
+            return "weakening", "#c60"
+        return "neutral", "#888"
+
+    rows = []
+    for s in snapshots:
+        if s.error:
+            rows.append(html.Tr([
+                html.Td(s.ticker, style={"fontWeight": "bold"}),
+                html.Td(s.error, colSpan=13, style={"color": "red"}),
+            ]))
+            continue
+        macd_label, macd_color = _macd_signal_label(s.macd, s.macd_signal, s.macd_hist)
+        hist_color = "#080" if (s.macd_hist or 0) > 0 else ("#b00" if (s.macd_hist or 0) < 0 else "#333")
+        c1 = "#080" if (s.change_1d_pct or 0) > 0 else ("#b00" if (s.change_1d_pct or 0) < 0 else "#333")
+        rvol_color, rvol_weight = _rvol_color(s.rvol)
+        rvol_text = f"{s.rvol:.2f}×" if s.rvol is not None else "—"
+
+        # Action: Buy if RSI > 50 (bullish bias) AND RVOL elevated (>1.5, green) AND MACD bullish
+        rsi_bullish = s.rsi is not None and s.rsi > 50
+        rvol_green = s.rvol is not None and s.rvol > 1.5
+        macd_bullish = macd_label == "bullish ↑"
+        if rsi_bullish and rvol_green and macd_bullish:
+            action_text, action_color = "BUY", "#080"
+        else:
+            action_text, action_color = "—", "#888"
+
+        rows.append(html.Tr([
+            html.Td(f"{s.name} ({s.ticker})", style={"fontWeight": "bold"}),
+            html.Td(f"${_num(s.price)}"),
+            html.Td(_pct(s.change_1d_pct), style={"color": c1}),
+            html.Td(_pct(s.change_5d_pct)),
+            html.Td(_pct(s.change_20d_pct)),
+            html.Td(_num(s.bb_upper), style={"color": _bb_cell_color(s.price, s.bb_upper, "upper")}),
+            html.Td(_num(s.bb_middle)),
+            html.Td(_num(s.bb_lower), style={"color": _bb_cell_color(s.price, s.bb_lower, "lower")}),
+            html.Td(_rsi_int(s.rsi), style={"color": _rsi_color(s.rsi), "fontWeight": "bold"}),
+            html.Td(_num(s.macd)),
+            html.Td(_num(s.macd_hist), style={"color": hist_color, "fontWeight": "bold"}),
+            html.Td(macd_label, style={"color": macd_color, "fontSize": "11px", "fontWeight": "bold"}),
+            html.Td(rvol_text, style={"color": rvol_color, "fontWeight": rvol_weight}),
+            html.Td(action_text, style={"color": action_color, "fontWeight": "bold",
+                                         "fontSize": "12px", "textAlign": "center"}),
+        ]))
+
+    header = html.Tr([
+        html.Th("Asset"), html.Th("Price"),
+        html.Th("1d"), html.Th("5d"), html.Th("20d"),
+        html.Th("上轨"), html.Th("中轨"), html.Th("下轨"),
+        html.Th("RSI"),
+        html.Th("MACD"), html.Th("Hist"), html.Th("Signal"),
+        html.Th("RVOL"),
+        html.Th("Action"),
+    ])
+
+    return html.Div([
+        html.H4("Technicals — All Tracked Tickers"),
+        html.Table([header] + rows,
+                   style={"borderCollapse": "collapse", "width": "100%",
+                          "fontSize": "12px", "textAlign": "left"}),
+        html.P("BB: 20-day, 2σ | RSI: 14-day (≥70 overbought, ≤30 oversold) | "
+               "MACD: 12/26/9 EMA — Hist = MACD − Signal (positive = bullish momentum accelerating) | "
+               "RVOL: today's volume ÷ avg of prior 5 trading days (>1.5 elevated, >2.0 abnormal) | "
+               "Action = BUY when RSI>50 AND RVOL>1.5 AND MACD bullish",
+               style={"fontSize": "11px", "color": "#666", "marginTop": "8px"}),
+    ], style={"overflowX": "auto"})
+
+
+@callback(
+    Output("tech-output", "children"),
+    Input("tech-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def on_load_technicals(n_clicks):
+    snapshots = get_all_technical_snapshots()
+    return _render_technicals(snapshots)
+
+
+def _render_portfolio(result: dict) -> html.Div:
+    """Render portfolio chart + per-position table + summary."""
+    if result.get("error") and not result.get("positions"):
+        return html.P(result["error"], style={"color": "red"})
+
+    # Time-series chart
+    fig = go.Figure()
+    if result["dates"]:
+        fig.add_trace(go.Scatter(
+            x=result["dates"], y=result["total_values"],
+            mode="lines", name="Total Portfolio Value",
+            line={"color": "#0a6", "width": 2},
+            fill="tozeroy", fillcolor="rgba(0,170,102,0.08)",
+        ))
+    fig.update_layout(
+        title="Total Portfolio Value Over Time",
+        xaxis_title="Date", yaxis_title="Value ($)",
+        margin={"l": 50, "r": 20, "t": 40, "b": 40},
+        height=360, template="simple_white",
+    )
+
+    # Per-position table
+    def _money(v): return f"${v:,.2f}" if v is not None else "—"
+    def _pnl(v):
+        if v is None:
+            return html.Td("—")
+        color = "#080" if v >= 0 else "#b00"
+        return html.Td(f"{'+' if v >= 0 else ''}${v:,.2f}", style={"color": color, "fontWeight": "bold"})
+
+    rows = []
+    for p in result["positions"]:
+        if p.error:
+            rows.append(html.Tr([
+                html.Td(p.ticker, style={"fontWeight": "bold"}),
+                html.Td(f"{p.shares:g}"),
+                html.Td(_money(p.invested)),
+                html.Td(p.error, colSpan=3, style={"color": "red"}),
+            ]))
+            continue
+        rows.append(html.Tr([
+            html.Td(p.ticker, style={"fontWeight": "bold"}),
+            html.Td(f"{p.shares:g}"),
+            html.Td(f"${p.entry_price:,.2f}"),
+            html.Td(_money(p.invested)),
+            html.Td(_money(p.current_value)),
+            _pnl(p.pnl),
+        ]))
+
+    header = html.Tr([
+        html.Th("Ticker"), html.Th("Shares"), html.Th("Entry Price"),
+        html.Th("Invested"), html.Th("Current Value"), html.Th("PnL"),
+    ])
+
+    # Summary
+    current_total = result["total_values"][-1] if result["total_values"] else result["cash"]
+    total_pnl = current_total - (result["invested"] + result["cash"])
+    pnl_color = "#080" if total_pnl >= 0 else "#b00"
+    summary = html.Div([
+        html.Div([html.Span("Invested: ", style={"fontWeight": "bold"}),
+                  html.Span(_money(result["invested"]))], style={"marginRight": "24px"}),
+        html.Div([html.Span("Cash (remaining): ", style={"fontWeight": "bold"}),
+                  html.Span(_money(result["cash"]))], style={"marginRight": "24px"}),
+        html.Div([html.Span("Current Total: ", style={"fontWeight": "bold"}),
+                  html.Span(_money(current_total))], style={"marginRight": "24px"}),
+        html.Div([html.Span("Total PnL: ", style={"fontWeight": "bold"}),
+                  html.Span(f"{'+' if total_pnl >= 0 else ''}${total_pnl:,.2f}",
+                           style={"color": pnl_color, "fontWeight": "bold"})]),
+    ], style={"display": "flex", "flexWrap": "wrap", "gap": "8px",
+              "padding": "12px", "backgroundColor": "#f8f8f8", "borderRadius": "6px",
+              "marginBottom": "16px", "fontSize": "13px"})
+
+    return html.Div([
+        summary,
+        dcc.Graph(figure=fig),
+        html.H4("Per-Position Detail", style={"marginTop": "16px"}),
+        html.Table([header] + rows,
+                   style={"borderCollapse": "collapse", "width": "100%",
+                          "fontSize": "13px", "textAlign": "left"}),
+    ])
+
+
+@callback(
+    Output("pf-positions", "data"),
+    Input("pf-add-row", "n_clicks"),
+    State("pf-positions", "data"),
+    prevent_initial_call=True,
+)
+def on_add_portfolio_row(n_clicks, rows):
+    rows = list(rows or [])
+    rows.append({"ticker": "", "entry_price": None, "shares": None})
+    return rows
+
+
+@callback(
+    Output("pf-output", "children"),
+    Input("pf-btn", "n_clicks"),
+    State("pf-positions", "data"),
+    State("pf-capital", "value"),
+    prevent_initial_call=True,
+)
+def on_compute_portfolio(n_clicks, positions, capital):
+    if not capital or capital <= 0:
+        return html.P("Enter a positive Total Capital.", style={"color": "red"})
+    result = compute_portfolio(positions or [], float(capital))
+    return _render_portfolio(result)
 
 
 if __name__ == "__main__":
