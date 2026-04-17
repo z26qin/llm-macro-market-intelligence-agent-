@@ -56,13 +56,13 @@ def _move_classification(snapshots: list[PriceSnapshot]) -> str:
     return "divergent moves — likely idiosyncratic or stock-specific"
 
 
-def _top_drivers(results: list[SearchResult], n: int = 3) -> list[str]:
-    """Extract top headline drivers."""
+def _top_drivers(results: list[SearchResult], n: int = 3) -> list[tuple[int, str]]:
+    """Extract top headline drivers with source numbers for citation."""
     drivers = []
-    for r in results[:n]:
+    for i, r in enumerate(results[:n], 1):
         title = r.title.strip()
         if title:
-            drivers.append(title)
+            drivers.append((i, title))
     return drivers
 
 
@@ -93,18 +93,21 @@ def generate_narrative(
     drivers = _top_drivers(results)
     lines.append("\n## Key Drivers")
     if drivers:
-        for i, d in enumerate(drivers, 1):
-            lines.append(f"{i}. {d}")
+        for source_num, headline in drivers:
+            lines.append(f"{source_num}. {headline} [Source {source_num}]")
     else:
         lines.append("- No headline drivers retrieved.")
 
     # ── Sentiment read ───────────────────────────────────────────────────
     lines.append("\n## Sentiment Read")
     read = _sentiment_read(sentiment)
+
+    # Reference the sources that contributed to sentiment
+    source_refs = " ".join([f"[Source {i}]" for i, _ in drivers]) if drivers else ""
     lines.append(
-        f"Headline sentiment is **{read}** "
-        f"(avg score: {sentiment.avg_score:+.3f}, "
-        f"+{sentiment.positive} / -{sentiment.negative} / ~{sentiment.neutral}, "
+        f"Headline sentiment is **{read}** based on analysis of retrieved news {source_refs}. "
+        f"Aggregate score: {sentiment.avg_score:+.3f} "
+        f"(+{sentiment.positive} positive / -{sentiment.negative} negative / ~{sentiment.neutral} neutral, "
         f"mode: {sentiment.mode})."
     )
 
@@ -113,26 +116,56 @@ def generate_narrative(
     lines.append("\n## Market Interpretation")
     lines.append(f"Price action suggests **{classification}**.")
 
+    # Add source references to divergence detection
+    source_refs_str = ", ".join([f"[Source {i}]" for i, _ in drivers]) if drivers else ""
+
     if sentiment.avg_score > 0.05 and any(
         (s.change_1d_pct or 0) < -0.3 for s in snapshots
     ):
         lines.append(
-            "Note: positive sentiment diverges from negative price action — "
+            f"Note: positive sentiment from headlines {source_refs_str} diverges from negative price action — "
             "watch for potential mean reversion or delayed headline impact."
         )
     elif sentiment.avg_score < -0.05 and any(
         (s.change_1d_pct or 0) > 0.3 for s in snapshots
     ):
         lines.append(
-            "Note: negative sentiment diverges from positive price action — "
+            f"Note: negative sentiment from headlines {source_refs_str} diverges from positive price action — "
             "market may be looking through near-term headwinds."
         )
+
+    # ── Confidence Assessment ────────────────────────────────────────────
+    lines.append("\n## Confidence Assessment")
+
+    # Determine confidence level based on data quality
+    confidence_factors = []
+    confidence_level = "HIGH"
+
+    # Check data availability
+    available_prices = sum(1 for s in snapshots if not s.error)
+    if available_prices < len(snapshots) * 0.5:
+        confidence_level = "MEDIUM"
+        confidence_factors.append("limited price data availability")
+
+    # Check headline coverage
+    if len(results) < 3:
+        confidence_level = "MEDIUM" if confidence_level == "HIGH" else "LOW"
+        confidence_factors.append("limited headline coverage")
+
+    # Check sentiment mode
+    if sentiment.mode == "mock":
+        confidence_level = "MEDIUM" if confidence_level == "HIGH" else "LOW"
+        confidence_factors.append("using keyword-based sentiment (not FinBERT)")
+
+    lines.append(f"Overall confidence: **{confidence_level}**")
+    if confidence_factors:
+        lines.append(f"Limiting factors: {', '.join(confidence_factors)}")
 
     # ── Caveats ──────────────────────────────────────────────────────────
     lines.append("\n## Caveats")
     caveats = [
         "Prototype analysis — not investment advice.",
-        f"Based on {len(results)} retrieved headlines; coverage may be incomplete.",
+        f"Based on {len(results)} retrieved headlines {source_refs_str}; coverage may be incomplete.",
     ]
     if sentiment.mode == "mock":
         caveats.append("Sentiment scored via keyword heuristic (mock mode).")

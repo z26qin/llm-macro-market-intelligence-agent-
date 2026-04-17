@@ -1,5 +1,5 @@
 dash[cloud]>=2.14
-yfinance>=0.2.31
+yfinance>=1.2.0
 tavily-python>=0.3.0
 transformers>=4.36
 torch>=2.0

@@ -9,7 +9,8 @@ from services.search import search_tavily, SearchResult
 from services.market_data import get_snapshots_for_query, PriceSnapshot, get_credit_spreads, CreditSpread
 from services.sentiment import analyze_sentiment, SentimentSummary
 from services.narrative import generate_narrative
-from services.llm import generate_narrative_with_fallback
+from services.llm import generate_and_validate_narrative
+from services.validation import ValidationResult
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Orchestrator
@@ -41,8 +42,8 @@ def run_analysis(query: str, query_type: str) -> dict:
     if query_type == "credit":
         credit_spreads = get_credit_spreads()
 
-    # 5. Narrative (vLLM with template fallback)
-    narrative = generate_narrative_with_fallback(
+    # 5. Narrative generation with validation (vLLM with template fallback)
+    narrative, validation = generate_and_validate_narrative(
         topic=query,
         query_type=query_type,
         results=results,
@@ -56,6 +57,7 @@ def run_analysis(query: str, query_type: str) -> dict:
         "snapshots": snapshots,
         "sentiment": sentiment,
         "narrative": narrative,
+        "validation": validation,
         "credit_spreads": credit_spreads,
         "query_type": query_type,
     }
@@ -204,7 +206,7 @@ def _render_credit_spreads(spreads: list[CreditSpread]) -> html.Div:
 
     header = html.Tr([
         html.Th("Spread"),
-        html.Th("Ratio"),
+        html.Th("Value"),
         html.Th("1d Δ"),
         html.Th("5d Δ"),
         html.Th("Interpretation"),
@@ -241,6 +243,93 @@ def _render_narrative(narrative: str) -> html.Div:
         dcc.Markdown(narrative, style={"backgroundColor": "#f8f8f8", "padding": "16px",
                                         "borderRadius": "6px", "fontSize": "13px",
                                         "lineHeight": "1.6", "whiteSpace": "pre-wrap"}),
+    ])
+
+
+def _render_validation(validation: ValidationResult) -> html.Div:
+    """Render validation results with confidence score and warnings."""
+    # Determine overall status color
+    if validation.passed and validation.confidence_score >= 80:
+        status_color = "#080"  # green
+        status_text = "✓ VERIFIED"
+    elif validation.passed and validation.confidence_score >= 60:
+        status_color = "#f90"  # orange
+        status_text = "⚠ VERIFIED (Medium Confidence)"
+    elif validation.passed:
+        status_color = "#f90"  # orange
+        status_text = "⚠ VERIFIED (Low Confidence)"
+    else:
+        status_color = "#b00"  # red
+        status_text = "✗ VALIDATION FAILED"
+
+    # Build validation details
+    details_items = []
+
+    # Confidence score
+    details_items.append(
+        html.Div([
+            html.Span("Overall Confidence: ", style={"fontWeight": "bold"}),
+            html.Span(f"{validation.confidence_score:.0f}/100",
+                     style={"color": status_color, "fontWeight": "bold", "fontSize": "16px"}),
+        ], style={"marginBottom": "8px"})
+    )
+
+    # Numerical verification stats
+    num_ver = validation.numerical_verification
+    details_items.append(
+        html.Div([
+            html.Span("Numerical Claims: ", style={"fontWeight": "bold"}),
+            html.Span(f"{num_ver['verified_claims']}/{num_ver['total_claims']} verified"),
+            html.Span(f" ({num_ver['verification_rate']*100:.0f}%)",
+                     style={"fontSize": "11px", "color": "#666"}),
+        ], style={"marginBottom": "4px"})
+    )
+
+    # Citation verification stats
+    cite_ver = validation.citation_verification
+    details_items.append(
+        html.Div([
+            html.Span("Citations: ", style={"fontWeight": "bold"}),
+            html.Span(f"{cite_ver['unique_citations']} sources cited"),
+            html.Span(f" ({cite_ver['citation_coverage']*100:.0f}% coverage)",
+                     style={"fontSize": "11px", "color": "#666"}),
+        ], style={"marginBottom": "4px"})
+    )
+
+    # Errors
+    if validation.errors:
+        error_list = html.Ul([html.Li(err, style={"color": "#b00"}) for err in validation.errors],
+                            style={"marginLeft": "16px", "fontSize": "12px"})
+        details_items.append(
+            html.Div([
+                html.Span("❌ Errors:", style={"fontWeight": "bold", "color": "#b00"}),
+                error_list,
+            ], style={"marginTop": "8px"})
+        )
+
+    # Warnings
+    if validation.warnings:
+        warning_list = html.Ul([html.Li(warn, style={"color": "#f90"}) for warn in validation.warnings],
+                              style={"marginLeft": "16px", "fontSize": "12px"})
+        details_items.append(
+            html.Div([
+                html.Span("⚠️ Warnings:", style={"fontWeight": "bold", "color": "#f90"}),
+                warning_list,
+            ], style={"marginTop": "8px"})
+        )
+
+    return html.Div([
+        html.H4("Anti-Hallucination Validation",
+               style={"display": "flex", "alignItems": "center", "gap": "12px"}),
+        html.Div([
+            html.Span(status_text, style={"color": status_color, "fontWeight": "bold",
+                                          "fontSize": "14px", "padding": "4px 12px",
+                                          "backgroundColor": f"{status_color}22",
+                                          "borderRadius": "4px", "border": f"1px solid {status_color}"}),
+        ], style={"marginBottom": "12px"}),
+        html.Div(details_items,
+                style={"fontSize": "13px", "backgroundColor": "#f8f8f8",
+                       "padding": "12px", "borderRadius": "6px"}),
     ])
 
 
@@ -296,6 +385,8 @@ def on_run(n_clicks, query, query_type):
         _render_headlines(data["results"]),
         html.Hr(),
         _render_narrative(data["narrative"]),
+        html.Hr(),
+        _render_validation(data["validation"]),
         html.Hr(),
         _render_debug(data["results"], data["sentiment"]),
     ])

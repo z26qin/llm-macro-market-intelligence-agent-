@@ -18,7 +18,8 @@ import requests
 
 from services.market_data import PriceSnapshot
 from services.search import SearchResult
-from services.sentiment import SentimentSummary
+from services.sentiment import SentimentSummary  # noqa: F401 — used in type hints below
+from services.validation import validate_narrative, ValidationResult
 
 
 DEFAULT_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
@@ -46,10 +47,10 @@ def _format_price_data(snapshots: list[PriceSnapshot]) -> str:
 
 
 def _format_headlines(results: list[SearchResult]) -> str:
-    """Format search results as headlines for the prompt."""
+    """Format search results as numbered headlines for the prompt (enables citation)."""
     lines = []
     for i, r in enumerate(results[:5], 1):
-        lines.append(f"{i}. {r.title}")
+        lines.append(f"[Source {i}] {r.title}")
         if r.snippet:
             lines.append(f"   {r.snippet[:150]}...")
     return "\n".join(lines) if lines else "No headlines available."
@@ -71,27 +72,49 @@ def _build_prompt(
     headlines: str,
     sentiment_summary: str,
 ) -> str:
-    """Build the prompt for the LLM."""
-    return f"""You are a macro market analyst.
+    """Build the prompt for the LLM with citation enforcement and uncertainty quantification."""
+    return f"""You are a macro market analyst. Your task is to explain today's market moves using ONLY the provided evidence.
 
-Explain the likely drivers behind today's move in {topic}.
+CRITICAL REQUIREMENTS:
+1. CITE EVERY CLAIM: For every factual claim you make, you MUST cite the specific source using [Source N] notation
+2. USE EXACT NUMBERS: When mentioning price changes, use the exact percentages from the market data
+3. QUANTIFY CONFIDENCE: Rate your confidence for each section (HIGH/MEDIUM/LOW)
+4. NO SPECULATION: If evidence is insufficient, state "INSUFFICIENT DATA" instead of guessing
 
-Market data:
+Available evidence:
+
+Market data (use exact percentages):
 {price_data}
 
-News evidence:
+News sources (cite as [Source N]):
 {headlines}
 
 Sentiment summary:
 {sentiment_summary}
 
-Produce a short explanation with the following sections:
-1. Move Summary
-2. Likely Drivers
-3. Market Interpretation
-4. Confidence Level
+Generate a structured analysis with these sections:
 
-Be concise and analytical."""
+1. MOVE SUMMARY (Confidence: HIGH/MEDIUM/LOW)
+   - State the price movements using exact percentages from market data
+   - Cite any news sources that explain the moves [Source N]
+
+2. LIKELY DRIVERS (Confidence: HIGH/MEDIUM/LOW)
+   - List 2-3 key drivers, each with a citation [Source N]
+   - If multiple sources support a driver, cite all relevant sources
+
+3. MARKET INTERPRETATION (Confidence: HIGH/MEDIUM/LOW)
+   - Provide your interpretation of market sentiment
+   - Support with citations to news sources [Source N]
+
+4. OVERALL CONFIDENCE SCORE: [0-100]
+   - Rate your overall confidence in this analysis (0-100)
+   - Explain what factors limit your confidence
+
+REMEMBER:
+- Every claim needs a [Source N] citation
+- Use exact numbers from market data
+- State "INSUFFICIENT DATA" if unsupported
+- Be concise (200-300 words total)"""
 
 
 def is_llm_available() -> bool:
@@ -102,14 +125,14 @@ def is_llm_available() -> bool:
 def generate_market_narrative(
     topic: str,
     price_data: dict,
-    headlines: list,
-    sentiment_summary: dict,
+    headlines: list[SearchResult],
+    sentiment_summary: SentimentSummary,
 ) -> str:
     """Generate a market narrative using vLLM.
 
     Args:
         topic: The market topic being analyzed (e.g., "NVDA", "oil")
-        price_data: Dict containing price snapshots (list of PriceSnapshot objects)
+        price_data: Dict with key "snapshots" containing list of PriceSnapshot objects
         headlines: List of SearchResult objects with news headlines
         sentiment_summary: SentimentSummary object with sentiment analysis
 
@@ -147,7 +170,7 @@ def generate_market_narrative(
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.2,
-        "max_tokens": 300,
+        "max_tokens": 500,
     }
 
     try:
@@ -169,6 +192,53 @@ def generate_market_narrative(
         raise RuntimeError(f"vLLM request failed: {e}")
     except (KeyError, IndexError) as e:
         raise RuntimeError(f"Unexpected vLLM response format: {e}")
+
+
+def generate_and_validate_narrative(
+    topic: str,
+    query_type: str,
+    results: list[SearchResult],
+    snapshots: list[PriceSnapshot],
+    sentiment: SentimentSummary,
+    template_fallback_fn,
+) -> tuple[str, ValidationResult]:
+    """Generate narrative and validate it for hallucinations.
+
+    Args:
+        topic: The query/topic being analyzed
+        query_type: Type of query (oil, neocloud, ticker, macro)
+        results: Search results from Tavily
+        snapshots: Price snapshots from yfinance
+        sentiment: Sentiment analysis summary
+        template_fallback_fn: Fallback function to use if vLLM is unavailable
+
+    Returns:
+        Tuple of (narrative string, ValidationResult object)
+    """
+    # Generate the narrative
+    narrative = generate_narrative_with_fallback(
+        topic, query_type, results, snapshots, sentiment, template_fallback_fn
+    )
+
+    # Convert snapshots to dict format for validation
+    market_data = []
+    for snapshot in snapshots:
+        market_data.append({
+            'ticker': snapshot.ticker,
+            'current_price': snapshot.price if not snapshot.error else None,
+            'change_1d': snapshot.change_1d_pct,
+            'change_5d': snapshot.change_5d_pct
+        })
+
+    # Validate the narrative
+    validation_result = validate_narrative(
+        narrative=narrative,
+        market_data=market_data,
+        num_sources=min(len(results), 5),  # We only include top 5 in prompt
+        sentiment_score=sentiment.avg_score
+    )
+
+    return narrative, validation_result
 
 
 def generate_narrative_with_fallback(
