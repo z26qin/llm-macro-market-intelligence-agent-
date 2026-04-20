@@ -18,6 +18,9 @@ from services.llm import generate_and_validate_narrative
 from services.validation import ValidationResult
 from services.portfolio import compute_portfolio, PositionResult
 from services.fear_greed import get_cnn_fear_greed, get_crypto_fear_greed, FearGreedIndex
+from services.classifier import classify_query, ClassificationResult
+from services.agent import run_agent, AgentResult, AgentTrace
+from services.llm import is_llm_available
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Orchestrator
@@ -96,6 +99,7 @@ analysis_tab = html.Div(
                 dcc.Dropdown(
                     id="query-type",
                     options=[
+                        {"label": "Auto (classify)", "value": "auto"},
                         {"label": "Oil", "value": "oil"},
                         {"label": "NeoCloud / AI Infra", "value": "neocloud"},
                         {"label": "Crypto", "value": "crypto"},
@@ -104,7 +108,7 @@ analysis_tab = html.Div(
                         {"label": "Custom Ticker", "value": "ticker"},
                         {"label": "Macro Topic", "value": "macro"},
                     ],
-                    value="ticker",
+                    value="auto",
                     clearable=False,
                     style={"width": "200px", "fontSize": "14px"},
                 ),
@@ -113,6 +117,13 @@ analysis_tab = html.Div(
                 "Run Analysis", id="run-btn",
                 style={"padding": "8px 20px", "fontSize": "14px",
                        "cursor": "pointer", "backgroundColor": "#222",
+                       "color": "#fff", "border": "none", "borderRadius": "4px"},
+            ),
+            html.Button(
+                "Run with Agent 🤖", id="agent-btn",
+                title="Tool-calling ReAct loop (requires vLLM with tool-call support)",
+                style={"padding": "8px 20px", "fontSize": "14px",
+                       "cursor": "pointer", "backgroundColor": "#06c",
                        "color": "#fff", "border": "none", "borderRadius": "4px"},
             ),
         ]),
@@ -400,6 +411,19 @@ def _render_validation(validation: ValidationResult) -> html.Div:
         ], style={"marginBottom": "8px"})
     )
 
+    # Self-correction attempts (only show when > 1)
+    attempts = getattr(validation, "attempts", 1)
+    if attempts > 1:
+        details_items.append(
+            html.Div([
+                html.Span("Self-correction: ", style={"fontWeight": "bold"}),
+                html.Span(f"{attempts} attempts",
+                         style={"color": "#06c", "fontWeight": "bold"}),
+                html.Span(" — agent re-prompted after validator feedback",
+                         style={"fontSize": "11px", "color": "#666", "marginLeft": "6px"}),
+            ], style={"marginBottom": "8px"})
+        )
+
     # Numerical verification stats
     num_ver = validation.numerical_verification
     details_items.append(
@@ -459,6 +483,125 @@ def _render_validation(validation: ValidationResult) -> html.Div:
     ])
 
 
+def _render_classification(c: ClassificationResult) -> html.Div:
+    badge_color = "#06c" if c.used_llm else "#888"
+    badge_text = "LLM-classified" if c.used_llm else "heuristic fallback"
+    tickers = ", ".join(c.tickers) if c.tickers else "—"
+    return html.Div([
+        html.Div([
+            html.Span("🤖 Query Classifier: ", style={"fontWeight": "bold"}),
+            html.Span(f"{c.query_type}", style={
+                "color": "#fff", "backgroundColor": badge_color,
+                "padding": "2px 8px", "borderRadius": "3px",
+                "fontWeight": "bold", "fontSize": "12px",
+            }),
+            html.Span(f"  ({badge_text})", style={"fontSize": "11px", "color": "#888"}),
+        ]),
+        html.Div([
+            html.Span("Tickers extracted: ", style={"fontWeight": "bold", "fontSize": "12px"}),
+            html.Span(tickers, style={"fontSize": "12px", "fontFamily": "Menlo, monospace"}),
+        ], style={"marginTop": "4px"}),
+        html.Div([
+            html.Span("Reasoning: ", style={"fontWeight": "bold", "fontSize": "12px"}),
+            html.Span(c.reasoning, style={"fontSize": "12px", "color": "#555"}),
+        ], style={"marginTop": "4px"}),
+    ], style={"padding": "10px 14px", "backgroundColor": "#f0f6ff",
+              "borderLeft": "3px solid #06c", "borderRadius": "4px"})
+
+
+def _run_agent_path(query: str, query_type_hint: str) -> html.Div:
+    """Agent-mode dispatch: tool-calling ReAct loop (Step 3)."""
+    hint = query_type_hint if query_type_hint != "auto" else "macro"
+    if not is_llm_available():
+        return html.Div([
+            html.P("⚠ Agent mode requires a vLLM endpoint with tool-calling support.",
+                   style={"color": "#b00", "fontWeight": "bold"}),
+            html.P("Set VLLM_ENDPOINT and ensure the server was started with "
+                   "`--enable-auto-tool-choice --tool-call-parser llama3_json`.",
+                   style={"fontSize": "12px", "color": "#666"}),
+        ])
+    try:
+        agent = run_agent(query, query_type_hint=hint)
+    except Exception as e:
+        return html.Div([
+            html.P(f"Agent failed: {e}", style={"color": "#b00"}),
+        ])
+
+    components = [
+        _render_agent_trace(agent),
+        html.Hr(),
+    ]
+    if agent.collected.get("snapshots"):
+        components.append(_render_prices(agent.collected["snapshots"]))
+        components.append(html.Hr())
+    if agent.collected.get("credit_spreads"):
+        components.append(_render_credit_spreads(agent.collected["credit_spreads"]))
+        components.append(html.Hr())
+    if agent.collected.get("sentiment"):
+        components.append(_render_sentiment(agent.collected["sentiment"]))
+        components.append(html.Hr())
+    if agent.collected.get("results"):
+        components.append(_render_headlines(agent.collected["results"]))
+        components.append(html.Hr())
+    components.extend([
+        _render_narrative(agent.narrative),
+        html.Hr(),
+        _render_validation(agent.validation),
+    ])
+    return html.Div(components)
+
+
+def _render_agent_trace(agent_result: AgentResult) -> html.Div:
+    """Render the tool-calling agent's reasoning trace (Step 3)."""
+    reason_color = {
+        "finalized": "#080",
+        "no_more_tools": "#c80",
+        "max_iters": "#b00",
+    }.get(agent_result.stop_reason, "#b00")
+
+    trace_items = []
+    for i, step in enumerate(agent_result.trace, 1):
+        trace_items.append(html.Div([
+            html.Span(f"{i}. ", style={"color": "#888"}),
+            html.Span(step.tool, style={"fontWeight": "bold", "color": "#06c",
+                                         "fontFamily": "Menlo, monospace"}),
+            html.Span(f"({', '.join(f'{k}={_truncate_arg(v)}' for k, v in step.args.items())})",
+                     style={"fontSize": "11px", "color": "#555",
+                            "fontFamily": "Menlo, monospace"}),
+            html.Div(f"→ {step.summary}",
+                    style={"fontSize": "11px", "color": "#666", "marginLeft": "20px",
+                           "fontFamily": "Menlo, monospace"}),
+        ], style={"padding": "4px 0", "borderBottom": "1px dashed #eee"}))
+
+    header = html.Div([
+        html.Span("🤖 Agent trace: ", style={"fontWeight": "bold"}),
+        html.Span(f"{agent_result.iterations} iterations, "
+                 f"{len(agent_result.trace)} tool calls",
+                 style={"fontSize": "12px", "color": "#555"}),
+        html.Span(f"  [stop: {agent_result.stop_reason}]",
+                 style={"color": reason_color, "fontWeight": "bold", "fontSize": "11px"}),
+    ])
+
+    rationale = html.Div([
+        html.Span("Agent rationale: ", style={"fontWeight": "bold", "fontSize": "12px"}),
+        html.Span(agent_result.rationale or "—", style={"fontSize": "12px", "color": "#555"}),
+    ], style={"marginTop": "4px"}) if agent_result.rationale else None
+
+    return html.Div([
+        header,
+        rationale,
+        html.Div(trace_items, style={"marginTop": "8px", "backgroundColor": "#fafafa",
+                                      "padding": "8px 12px", "borderRadius": "4px",
+                                      "border": "1px solid #e0e0e0"}),
+    ], style={"padding": "10px 14px", "backgroundColor": "#f0f6ff",
+              "borderLeft": "3px solid #06c", "borderRadius": "4px"})
+
+
+def _truncate_arg(v, limit: int = 30) -> str:
+    s = str(v)
+    return s if len(s) <= limit else s[:limit - 3] + "..."
+
+
 def _render_debug(results: list[SearchResult], sentiment: SentimentSummary):
     return html.Details([
         html.Summary("Debug / Retrieved Evidence",
@@ -481,13 +624,26 @@ def _render_debug(results: list[SearchResult], sentiment: SentimentSummary):
 @callback(
     Output("output-area", "children"),
     Input("run-btn", "n_clicks"),
+    Input("agent-btn", "n_clicks"),
     State("query-input", "value"),
     State("query-type", "value"),
     prevent_initial_call=True,
 )
-def on_run(n_clicks, query, query_type):
+def on_run(run_clicks, agent_clicks, query, query_type):
     if not query:
         return html.P("Enter a query above.", style={"color": "#999"})
+
+    # Dispatch to whichever button fired
+    trigger = dash.callback_context.triggered[0]["prop_id"].split(".")[0] if dash.callback_context.triggered else "run-btn"
+
+    if trigger == "agent-btn":
+        return _run_agent_path(query, query_type)
+
+    # Query classifier agent (Step 2): when type is "auto", let the LLM pick.
+    classification: ClassificationResult | None = None
+    if query_type == "auto":
+        classification = classify_query(query)
+        query_type = classification.query_type
 
     data = run_analysis(query, query_type)
 
@@ -495,10 +651,14 @@ def on_run(n_clicks, query, query_type):
         return html.P(data["error"], style={"color": "red"})
 
     # Build output components
-    components = [
+    components = []
+    if classification is not None:
+        components.append(_render_classification(classification))
+        components.append(html.Hr())
+    components.extend([
         _render_prices(data["snapshots"]),
         html.Hr(),
-    ]
+    ])
 
     # Add credit spreads section if this is a credit query
     if data.get("query_type") == "credit" and data.get("credit_spreads"):

@@ -30,6 +30,7 @@ class ValidationResult:
     numerical_verification: Dict[str, Any]
     citation_verification: Dict[str, Any]
     confidence_score: float  # Overall confidence (0-100)
+    attempts: int = 1  # Number of LLM generation attempts (1 = no self-correction needed)
 
 
 def extract_numerical_claims(text: str) -> List[NumericalClaim]:

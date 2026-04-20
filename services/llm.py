@@ -24,6 +24,10 @@ from services.validation import validate_narrative, ValidationResult
 
 DEFAULT_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 
+# Self-correction loop config
+MAX_CORRECTION_ATTEMPTS = 3     # initial + up to 2 corrections
+MIN_ACCEPTABLE_CONFIDENCE = 60.0
+
 
 def _get_endpoint() -> str:
     """Get the vLLM endpoint URL."""
@@ -194,6 +198,98 @@ def generate_market_narrative(
         raise RuntimeError(f"Unexpected vLLM response format: {e}")
 
 
+def _build_correction_prompt(
+    topic: str,
+    price_data: str,
+    headlines: str,
+    sentiment_summary: str,
+    previous_narrative: str,
+    validation: ValidationResult,
+) -> str:
+    """Build a correction prompt that cites specific validator failures."""
+    errors_block = "\n".join(f"- {e}" for e in validation.errors) or "- (none)"
+    warnings_block = "\n".join(f"- {w}" for w in validation.warnings) or "- (none)"
+    return f"""You are a macro market analyst. Your previous analysis FAILED validation and must be rewritten.
+
+PREVIOUS ANALYSIS (reject and rewrite, do not merely edit):
+---
+{previous_narrative}
+---
+
+VALIDATOR ERRORS (must fix):
+{errors_block}
+
+VALIDATOR WARNINGS (should fix):
+{warnings_block}
+
+PREVIOUS CONFIDENCE SCORE: {validation.confidence_score:.0f}/100 (minimum acceptable: {MIN_ACCEPTABLE_CONFIDENCE:.0f})
+
+Common causes of failure:
+- Numerical mismatches: invented a percentage not present in the market data.
+  → Fix: use ONLY the exact numbers from the market data block below.
+- Missing citations: factual claims without [Source N] tags.
+  → Fix: every factual sentence must end with at least one [Source N].
+- Invalid citations: cited [Source N] where N exceeds available sources.
+  → Fix: only cite sources that exist below.
+
+Available evidence (same as before — rewrite strictly from this):
+
+Market data (use these exact percentages, no others):
+{price_data}
+
+News sources (cite as [Source N], N must be valid):
+{headlines}
+
+Sentiment summary:
+{sentiment_summary}
+
+Rewrite the analysis using the same 4-section structure:
+1. MOVE SUMMARY (Confidence: HIGH/MEDIUM/LOW)
+2. LIKELY DRIVERS (Confidence: HIGH/MEDIUM/LOW)
+3. MARKET INTERPRETATION (Confidence: HIGH/MEDIUM/LOW)
+4. OVERALL CONFIDENCE SCORE: [0-100]
+
+REMEMBER:
+- Every factual claim needs [Source N]
+- Use ONLY exact numbers from the market data
+- State "INSUFFICIENT DATA" if evidence is missing
+- Be concise (200-300 words)"""
+
+
+def _call_vllm(prompt: str) -> str:
+    """Call vLLM /chat/completions with a single user prompt, return text."""
+    endpoint = _get_endpoint()
+    if not endpoint:
+        raise ValueError("VLLM_ENDPOINT environment variable is not set")
+
+    headers = {"Content-Type": "application/json"}
+    api_key = os.getenv("VLLM_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {
+        "model": os.getenv("VLLM_MODEL", DEFAULT_MODEL),
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 500,
+    }
+
+    response = requests.post(
+        f"{endpoint}/chat/completions", headers=headers, json=payload, timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"].strip()
+
+
+def _snapshots_to_market_data(snapshots: list[PriceSnapshot]) -> list[dict]:
+    return [{
+        "ticker": s.ticker,
+        "current_price": s.price if not s.error else None,
+        "change_1d": s.change_1d_pct,
+        "change_5d": s.change_5d_pct,
+    } for s in snapshots]
+
+
 def generate_and_validate_narrative(
     topic: str,
     query_type: str,
@@ -202,43 +298,69 @@ def generate_and_validate_narrative(
     sentiment: SentimentSummary,
     template_fallback_fn,
 ) -> tuple[str, ValidationResult]:
-    """Generate narrative and validate it for hallucinations.
+    """Generate narrative and validate it, with self-correcting retry loop.
 
-    Args:
-        topic: The query/topic being analyzed
-        query_type: Type of query (oil, neocloud, ticker, macro)
-        results: Search results from Tavily
-        snapshots: Price snapshots from yfinance
-        sentiment: Sentiment analysis summary
-        template_fallback_fn: Fallback function to use if vLLM is unavailable
+    When vLLM is available and validation fails (or confidence < 60), the LLM
+    is re-prompted with the validator's structured errors/warnings. Caps at
+    MAX_CORRECTION_ATTEMPTS total attempts. Template fallback path does not
+    retry (no LLM available to learn from the feedback).
 
-    Returns:
-        Tuple of (narrative string, ValidationResult object)
+    Returns the best narrative + ValidationResult. `validation.attempts`
+    reports how many LLM calls were made.
     """
-    # Generate the narrative
+    market_data = _snapshots_to_market_data(snapshots)
+    num_sources = min(len(results), 5)
+
+    # Attempt 1 — uses fallback path (template if LLM unavailable)
     narrative = generate_narrative_with_fallback(
         topic, query_type, results, snapshots, sentiment, template_fallback_fn
     )
-
-    # Convert snapshots to dict format for validation
-    market_data = []
-    for snapshot in snapshots:
-        market_data.append({
-            'ticker': snapshot.ticker,
-            'current_price': snapshot.price if not snapshot.error else None,
-            'change_1d': snapshot.change_1d_pct,
-            'change_5d': snapshot.change_5d_pct
-        })
-
-    # Validate the narrative
-    validation_result = validate_narrative(
-        narrative=narrative,
-        market_data=market_data,
-        num_sources=min(len(results), 5),  # We only include top 5 in prompt
-        sentiment_score=sentiment.avg_score
+    validation = validate_narrative(
+        narrative=narrative, market_data=market_data,
+        num_sources=num_sources, sentiment_score=sentiment.avg_score,
     )
+    validation.attempts = 1
 
-    return narrative, validation_result
+    # No retries if LLM isn't available (template produces identical output)
+    if not is_llm_available():
+        return narrative, validation
+
+    # Pre-format static inputs once for correction prompts
+    price_block = _format_price_data(snapshots)
+    headlines_block = _format_headlines(results)
+    sentiment_block = _format_sentiment(sentiment)
+
+    # Track best result across attempts so a worse retry can't overwrite a better original
+    best_narrative, best_validation = narrative, validation
+
+    attempt = 1
+    while (
+        (not validation.passed or validation.confidence_score < MIN_ACCEPTABLE_CONFIDENCE)
+        and attempt < MAX_CORRECTION_ATTEMPTS
+    ):
+        attempt += 1
+        correction_prompt = _build_correction_prompt(
+            topic, price_block, headlines_block, sentiment_block,
+            previous_narrative=narrative, validation=validation,
+        )
+        try:
+            narrative = _call_vllm(correction_prompt)
+        except Exception as e:
+            print(f"[llm] correction attempt {attempt} failed: {e}")
+            break
+
+        validation = validate_narrative(
+            narrative=narrative, market_data=market_data,
+            num_sources=num_sources, sentiment_score=sentiment.avg_score,
+        )
+        validation.attempts = attempt
+
+        if validation.confidence_score > best_validation.confidence_score:
+            best_narrative, best_validation = narrative, validation
+
+    # Return the best version seen, not just the last
+    best_validation.attempts = attempt
+    return best_narrative, best_validation
 
 
 def generate_narrative_with_fallback(
