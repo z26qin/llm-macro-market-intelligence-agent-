@@ -17,7 +17,7 @@ QUERY_MACRO = "macro"
 OIL_TICKERS = ["CL=F", "BZ=F"]
 OIL_DISPLAY = {"CL=F": "WTI Crude", "BZ=F": "Brent Crude"}
 
-NEOCLOUD_TICKERS = ["NVDA", "NBIS", "CRWV", "ORCL", "MSFT", "CIFR"]
+NEOCLOUD_TICKERS = ["NVDA", "NBIS", "CRWV", "ORCL", "MSFT", "CIFR", "MRVL"]
 
 CRYPTO_TICKERS = ["BMNR", "MSTR", "BTC-USD"]
 

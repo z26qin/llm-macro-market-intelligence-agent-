@@ -17,6 +17,7 @@ from services.narrative import generate_narrative
 from services.llm import generate_and_validate_narrative
 from services.validation import ValidationResult
 from services.portfolio import compute_portfolio, PositionResult
+from services.fear_greed import get_cnn_fear_greed, get_crypto_fear_greed, FearGreedIndex
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Orchestrator
@@ -208,6 +209,29 @@ portfolio_tab = html.Div(
 )
 
 
+fear_greed_tab = html.Div(
+    style={"paddingTop": "16px"},
+    children=[
+        html.Div(style={"display": "flex", "gap": "12px", "alignItems": "center",
+                        "marginBottom": "16px"}, children=[
+            html.Button(
+                "Refresh Indices", id="fg-btn",
+                style={"padding": "8px 20px", "fontSize": "14px",
+                       "cursor": "pointer", "backgroundColor": "#222",
+                       "color": "#fff", "border": "none", "borderRadius": "4px"},
+            ),
+            html.Span("CNN-style Fear & Greed + Crypto Fear & Greed. "
+                      "Live components computed from SPY/VIX/TLT/HYG/BTC; "
+                      "items marked (mocked) use seeded values stable within a day.",
+                      style={"fontSize": "12px", "color": "#666"}),
+        ]),
+        dcc.Loading(id="fg-loading", type="default", children=[
+            html.Div(id="fg-output", style={"marginTop": "12px"}),
+        ]),
+    ],
+)
+
+
 app.layout = html.Div(
     style={"fontFamily": "Menlo, Consolas, monospace", "maxWidth": "1152px",
            "margin": "0 auto", "padding": "24px"},
@@ -218,6 +242,7 @@ app.layout = html.Div(
             dcc.Tab(label="Analysis", value="analysis", children=[analysis_tab]),
             dcc.Tab(label="Technicals", value="technicals", children=[technicals_tab]),
             dcc.Tab(label="Portfolio Construction", value="portfolio", children=[portfolio_tab]),
+            dcc.Tab(label="Fear & Greed", value="fear_greed", children=[fear_greed_tab]),
         ]),
     ],
 )
@@ -727,6 +752,133 @@ def on_compute_portfolio(n_clicks, positions, capital):
         return html.P("Enter a positive Total Capital.", style={"color": "red"})
     result = compute_portfolio(positions or [], float(capital))
     return _render_portfolio(result)
+
+
+def _fg_color(score: int) -> str:
+    if score <= 24:
+        return "#b00"
+    if score <= 44:
+        return "#e85"
+    if score <= 55:
+        return "#c90"
+    if score <= 75:
+        return "#6a0"
+    return "#080"
+
+
+def _fg_gauge(idx: FearGreedIndex, title: str) -> dcc.Graph:
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=idx.score,
+        number={"font": {"size": 40, "color": _fg_color(idx.score)}},
+        title={"text": f"<b>{title}</b><br><span style='font-size:14px;color:{_fg_color(idx.score)}'>"
+                        f"{idx.classification}</span>",
+                "font": {"size": 14}},
+        gauge={
+            "axis": {"range": [0, 100], "tickwidth": 1, "tickcolor": "#666"},
+            "bar": {"color": _fg_color(idx.score), "thickness": 0.25},
+            "bgcolor": "#fff",
+            "borderwidth": 1,
+            "bordercolor": "#ccc",
+            "steps": [
+                {"range": [0, 25],  "color": "#fbb"},
+                {"range": [25, 45], "color": "#fd9"},
+                {"range": [45, 55], "color": "#ff9"},
+                {"range": [55, 75], "color": "#cf8"},
+                {"range": [75, 100], "color": "#8c8"},
+            ],
+            "threshold": {"line": {"color": "#222", "width": 3}, "thickness": 0.8,
+                          "value": idx.score},
+        },
+    ))
+    fig.update_layout(height=280, margin={"l": 20, "r": 20, "t": 80, "b": 20},
+                      paper_bgcolor="#fff")
+    return dcc.Graph(figure=fig, config={"displayModeBar": False})
+
+
+def _render_fg_components(idx: FearGreedIndex) -> html.Div:
+    rows = []
+    for c in idx.components:
+        color = _fg_color(c.score)
+        badge = html.Span(_classify(c.score), style={
+            "color": color, "fontWeight": "bold", "fontSize": "11px",
+            "padding": "2px 8px", "borderRadius": "3px",
+            "backgroundColor": f"{color}22", "border": f"1px solid {color}",
+        })
+        mock_tag = html.Span(" (mocked)", style={"fontSize": "10px", "color": "#999",
+                                                 "fontStyle": "italic"}) if c.mocked else None
+        rows.append(html.Tr([
+            html.Td([c.name, mock_tag], style={"fontWeight": "bold"}),
+            html.Td(c.detail, style={"fontSize": "11px", "color": "#555"}),
+            html.Td(f"{c.score}", style={"color": color, "fontWeight": "bold",
+                                          "textAlign": "right"}),
+            html.Td(badge, style={"textAlign": "center"}),
+        ]))
+
+    header = html.Tr([
+        html.Th("Component"), html.Th("Detail"),
+        html.Th("Score", style={"textAlign": "right"}),
+        html.Th("Rating", style={"textAlign": "center"}),
+    ])
+    return html.Table([header] + rows,
+                      style={"borderCollapse": "collapse", "width": "100%",
+                             "fontSize": "12px", "textAlign": "left"})
+
+
+def _classify(score: int) -> str:
+    if score <= 24: return "Extreme Fear"
+    if score <= 44: return "Fear"
+    if score <= 55: return "Neutral"
+    if score <= 75: return "Greed"
+    return "Extreme Greed"
+
+
+def _render_fg_history(idx: FearGreedIndex) -> html.Div:
+    cells = []
+    for label, score in idx.history.items():
+        color = _fg_color(score)
+        cells.append(html.Div([
+            html.Div(label, style={"fontSize": "11px", "color": "#666"}),
+            html.Div(str(score), style={"fontSize": "22px", "fontWeight": "bold",
+                                         "color": color}),
+            html.Div(_classify(score), style={"fontSize": "10px", "color": color}),
+        ], style={"textAlign": "center", "padding": "8px 12px",
+                  "border": "1px solid #ddd", "borderRadius": "6px",
+                  "backgroundColor": "#fafafa", "flex": "1"}))
+    return html.Div(cells, style={"display": "flex", "gap": "8px",
+                                   "marginTop": "8px", "marginBottom": "16px"})
+
+
+def _render_fg_panel(idx: FearGreedIndex, title: str) -> html.Div:
+    if idx.error:
+        return html.Div([
+            html.H4(title),
+            html.P(f"Error: {idx.error}", style={"color": "red"}),
+        ])
+    return html.Div([
+        _fg_gauge(idx, title),
+        html.Div("Historical", style={"fontSize": "12px", "fontWeight": "bold",
+                                       "color": "#666", "marginTop": "-8px"}),
+        _render_fg_history(idx),
+        _render_fg_components(idx),
+    ])
+
+
+@callback(
+    Output("fg-output", "children"),
+    Input("fg-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def on_load_fear_greed(n_clicks):
+    cnn = get_cnn_fear_greed()
+    crypto = get_crypto_fear_greed()
+    return html.Div(
+        style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "24px"},
+        children=[
+            _render_fg_panel(cnn, "CNN-Style Fear &amp; Greed"),
+            _render_fg_panel(crypto, "Crypto Fear &amp; Greed"),
+        ],
+    )
 
 
 if __name__ == "__main__":
