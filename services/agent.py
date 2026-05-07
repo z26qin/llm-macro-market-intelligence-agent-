@@ -1,7 +1,9 @@
-"""Tool-calling ReAct agent — Step 3 of the agentic rollout.
+"""Tool-calling ReAct agent.
 
-The LLM dynamically decides which services to invoke for a given query instead
-of running the fixed pipeline. Uses vLLM's OpenAI-compatible tool-calling API.
+The LLM dynamically picks which tools to invoke for a given query instead of
+running the fixed pipeline. Uses vLLM's OpenAI-compatible tool-calling API.
+
+Tools live in `services.tools` (single registry, schema + impl per tool).
 
 Requires:
 - VLLM_ENDPOINT set
@@ -11,10 +13,13 @@ Requires:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-from dataclasses import dataclass, field
-from typing import Any, Callable
+import time
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any
 
 import requests
 
@@ -23,112 +28,24 @@ from services.llm import (
     generate_and_validate_narrative,
 )
 from services.narrative import generate_narrative
-from services.search import search_tavily
-from services.market_data import get_snapshots_for_query, get_credit_spreads
 from services.sentiment import analyze_sentiment
-from services.fear_greed import get_cnn_fear_greed, get_crypto_fear_greed
+from services import tools as tool_registry
 
 
-MAX_AGENT_ITERATIONS = 6
+MAX_AGENT_ITERATIONS = 10  # was 6 — more headroom for multi-tool exploration
+TRACE_DIR = ".cache/agent_traces"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool registry — JSON-schema for the LLM + Python impl for execution
+# Result types
 # ─────────────────────────────────────────────────────────────────────────────
-
-TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_news",
-            "description": "Search the web for recent news headlines about a query. Returns a list of titles and snippets.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query."},
-                    "query_type": {
-                        "type": "string",
-                        "enum": ["oil", "neocloud", "crypto", "ai_robotics", "credit", "ticker", "macro"],
-                        "description": "Category hint for the search; affects which source mix is used.",
-                    },
-                },
-                "required": ["query", "query_type"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_prices",
-            "description": "Fetch current price snapshots (price, 1d%, 5d%) for a query. Use this to get market data before writing a narrative.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "query_type": {
-                        "type": "string",
-                        "enum": ["oil", "neocloud", "crypto", "ai_robotics", "credit", "ticker", "macro"],
-                    },
-                },
-                "required": ["query", "query_type"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "analyze_sentiment",
-            "description": "Run FinBERT sentiment analysis on a list of headline texts. Call after search_news.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "texts": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["texts"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_credit_spreads",
-            "description": "Get current credit spread readings (HYG/LQD/JNK vs TLT benchmark). Use for credit-regime queries.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_fear_greed",
-            "description": "Get CNN-style and Crypto Fear & Greed indices. Use for regime/sentiment queries.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "finalize",
-            "description": "Call this LAST with a brief rationale when you have enough evidence. The orchestrator will run the template + validation pipeline on the collected data to produce the final narrative.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "rationale": {
-                        "type": "string",
-                        "description": "One sentence: why the collected evidence is sufficient.",
-                    },
-                },
-                "required": ["rationale"],
-            },
-        },
-    },
-]
-
 
 @dataclass
 class AgentTrace:
     tool: str
     args: dict[str, Any]
-    summary: str  # short human-readable result preview
+    summary: str       # short human-readable preview of the result
+    duration_ms: int = 0
 
 
 @dataclass
@@ -139,109 +56,48 @@ class AgentResult:
     collected: dict[str, Any]
     query_type: str
     iterations: int
-    stop_reason: str  # "finalized" | "max_iters" | "no_more_tools" | "llm_error"
+    stop_reason: str   # "finalized" | "max_iters" | "no_more_tools" | "llm_error: ..."
     rationale: str = ""
+    trace_path: str | None = None  # where the trace JSON was persisted
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool implementations — each mutates `collected` and returns a short JSON payload
+# System prompt — encourages a real plan→act→observe→reflect cycle
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _tool_search_news(collected: dict, query: str, query_type: str) -> dict:
-    results = search_tavily(query, query_type)
-    collected["results"] = results
-    collected.setdefault("query_type", query_type)
-    return {
-        "count": len(results),
-        "titles": [r.title for r in results[:5]],
-    }
+SYSTEM_PROMPT = """You are a macro market intelligence agent operating a tool-calling ReAct loop.
 
+For each query, run a deliberate plan → act → observe → reflect cycle:
+1. PLAN: pick the next single tool that closes the largest gap in your evidence.
+2. ACT: emit ONE tool call.
+3. OBSERVE: read the tool result.
+4. REFLECT: decide whether the evidence is sufficient or another tool is needed.
+5. Repeat until evidence is sufficient, then call `finalize`.
 
-def _tool_get_prices(collected: dict, query: str, query_type: str) -> dict:
-    snaps = get_snapshots_for_query(query, query_type)
-    collected["snapshots"] = snaps
-    collected.setdefault("query_type", query_type)
-    return {
-        "count": len(snaps),
-        "prices": [
-            {
-                "ticker": s.ticker,
-                "price": s.price,
-                "change_1d_pct": s.change_1d_pct,
-                "change_5d_pct": s.change_5d_pct,
-            }
-            for s in snaps if not s.error
-        ],
-    }
+Tool selection guidance:
+- `get_prices` and `search_news` are usually the first two calls.
+- `analyze_sentiment` runs on the headline TITLES returned by `search_news`.
+- `get_macro_panel` for any macro-flavored question (rates, dollar, vol, credit).
+  Prefer the panel; fall back to `get_macro_series` if you need exactly one series.
+- `get_positioning_panel` to scan for crowded extremes (|z|≥2). Or `get_positioning`
+  for a single market. Especially useful for commodities (CL, GC, HG) and equity
+  indices (ES, NQ).
+- `get_options_iv` to gauge expected vol on a single ticker. Compare to VIX or
+  realized vol when relevant.
+- `get_credit_spreads` only for credit/risk-appetite queries.
+- `get_fear_greed` only for broad regime/mood queries.
 
-
-def _tool_analyze_sentiment(collected: dict, texts: list[str]) -> dict:
-    summary = analyze_sentiment(texts or [])
-    collected["sentiment"] = summary
-    return {
-        "avg_score": summary.avg_score,
-        "positive": summary.positive,
-        "negative": summary.negative,
-        "neutral": summary.neutral,
-        "mode": summary.mode,
-    }
-
-
-def _tool_get_credit_spreads(collected: dict) -> dict:
-    spreads = get_credit_spreads()
-    collected["credit_spreads"] = spreads
-    return {
-        "spreads": [
-            {"name": sp.name, "spread": sp.spread,
-             "1d_change": sp.spread_1d_change,
-             "interpretation": sp.interpretation}
-            for sp in spreads
-        ],
-    }
-
-
-def _tool_get_fear_greed(collected: dict) -> dict:
-    cnn = get_cnn_fear_greed()
-    crypto = get_crypto_fear_greed()
-    collected["fear_greed"] = {"cnn": cnn, "crypto": crypto}
-    return {
-        "cnn": {"score": cnn.score, "classification": cnn.classification},
-        "crypto": {"score": crypto.score, "classification": crypto.classification},
-    }
-
-
-def _tool_finalize(collected: dict, rationale: str) -> dict:
-    collected["_finalize_rationale"] = rationale
-    return {"acknowledged": True, "rationale": rationale}
-
-
-TOOL_DISPATCH: dict[str, Callable[..., dict]] = {
-    "search_news": _tool_search_news,
-    "get_prices": _tool_get_prices,
-    "analyze_sentiment": _tool_analyze_sentiment,
-    "get_credit_spreads": _tool_get_credit_spreads,
-    "get_fear_greed": _tool_get_fear_greed,
-    "finalize": _tool_finalize,
-}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# The agent loop
-# ─────────────────────────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """You are a macro market intelligence agent with access to tools.
-
-Plan a minimal sequence of tool calls to gather evidence for the user's query, then call `finalize` to hand off to the narrative generator.
-
-Guidelines:
-- Usually call `get_prices` and `search_news` first.
-- Call `analyze_sentiment` with the headline TITLES from search_news if sentiment matters.
-- Call `get_credit_spreads` only for credit/risk-appetite queries.
-- Call `get_fear_greed` only for broad regime/mood queries.
+Hard rules:
 - Do NOT repeat a tool call with identical arguments.
-- Call `finalize` as soon as you have enough; aim for 2-4 tool calls total.
+- One tool call per turn; do not batch.
+- Cap: aim for 3-6 tool calls before `finalize`. Hard ceiling is 10 iterations.
+- Call `finalize` with a one-sentence rationale once evidence is sufficient.
 """
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vLLM tool-calling
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _call_vllm_with_tools(messages: list[dict]) -> dict:
     endpoint = _get_endpoint()
@@ -256,7 +112,7 @@ def _call_vllm_with_tools(messages: list[dict]) -> dict:
     payload = {
         "model": os.getenv("VLLM_MODEL", DEFAULT_MODEL),
         "messages": messages,
-        "tools": TOOL_SCHEMAS,
+        "tools": tool_registry.schemas(),
         "tool_choice": "auto",
         "temperature": 0.1,
         "max_tokens": 400,
@@ -272,6 +128,57 @@ def _truncate(obj: Any, limit: int = 80) -> str:
     s = json.dumps(obj, default=str)
     return s if len(s) <= limit else s[: limit - 3] + "..."
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trace persistence
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _persist_trace(query: str, query_type: str, messages: list[dict],
+                    trace: list[AgentTrace], result: AgentResult) -> str:
+    Path(TRACE_DIR).mkdir(parents=True, exist_ok=True)
+    qhash = hashlib.sha1(query.encode("utf-8")).hexdigest()[:8]
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    path = Path(TRACE_DIR) / f"{ts}_{query_type}_{qhash}.json"
+    payload = {
+        "query": query,
+        "query_type": query_type,
+        "stop_reason": result.stop_reason,
+        "iterations": result.iterations,
+        "rationale": result.rationale,
+        "trace": [asdict(t) for t in trace],
+        "messages": _redact_messages(messages),
+        "validation": {
+            "passed": getattr(result.validation, "passed", None),
+            "confidence_score": getattr(result.validation, "confidence_score", None),
+            "errors": getattr(result.validation, "errors", []),
+            "warnings": getattr(result.validation, "warnings", []),
+            "attempts": getattr(result.validation, "attempts", None),
+        },
+        "narrative": result.narrative,
+    }
+    try:
+        path.write_text(json.dumps(payload, default=str, indent=2))
+        return str(path)
+    except OSError as e:
+        print(f"[agent] failed to persist trace: {e}")
+        return ""
+
+
+def _redact_messages(messages: list[dict]) -> list[dict]:
+    """Drop oversized tool payloads from persisted messages — keep first 600 chars."""
+    out = []
+    for m in messages:
+        copy = dict(m)
+        content = copy.get("content")
+        if isinstance(content, str) and len(content) > 600:
+            copy["content"] = content[:600] + f"…(+{len(content)-600} chars)"
+        out.append(copy)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Loop
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_agent(query: str, query_type_hint: str = "macro") -> AgentResult:
     """Run the tool-calling agent. Raises if vLLM is unavailable."""
@@ -289,6 +196,9 @@ def run_agent(query: str, query_type_hint: str = "macro") -> AgentResult:
     trace: list[AgentTrace] = []
     stop_reason = "max_iters"
     rationale = ""
+    iteration = 0
+
+    seen_calls: set[tuple[str, str]] = set()
 
     for iteration in range(1, MAX_AGENT_ITERATIONS + 1):
         try:
@@ -313,16 +223,28 @@ def run_agent(query: str, query_type_hint: str = "macro") -> AgentResult:
             except json.JSONDecodeError:
                 args = {}
 
-            impl = TOOL_DISPATCH.get(name)
-            if impl is None:
-                result = {"error": f"unknown tool: {name}"}
+            # Guard: refuse to repeat the exact same call
+            sig = (name, json.dumps(args, sort_keys=True, default=str))
+            if sig in seen_calls and name != "finalize":
+                result = {"error": "duplicate call refused; pick a different tool or finalize"}
+                duration_ms = 0
             else:
-                try:
-                    result = impl(collected, **args)
-                except Exception as e:
-                    result = {"error": f"{type(e).__name__}: {e}"}
+                seen_calls.add(sig)
+                tool = tool_registry.get(name)
+                start = time.time()
+                if tool is None:
+                    result = {"error": f"unknown tool: {name}"}
+                else:
+                    try:
+                        result = tool.impl(collected, **args)
+                    except TypeError as e:
+                        result = {"error": f"bad arguments: {e}"}
+                    except Exception as e:
+                        result = {"error": f"{type(e).__name__}: {e}"}
+                duration_ms = int((time.time() - start) * 1000)
 
-            trace.append(AgentTrace(tool=name, args=args, summary=_truncate(result)))
+            trace.append(AgentTrace(tool=name, args=args,
+                                      summary=_truncate(result), duration_ms=duration_ms))
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.get("id", ""),
@@ -338,7 +260,6 @@ def run_agent(query: str, query_type_hint: str = "macro") -> AgentResult:
             stop_reason = "finalized"
             break
 
-    # Hand collected evidence to the existing narrative + validation pipeline
     narrative, validation = generate_and_validate_narrative(
         topic=query,
         query_type=collected.get("query_type", query_type_hint),
@@ -348,13 +269,11 @@ def run_agent(query: str, query_type_hint: str = "macro") -> AgentResult:
         template_fallback_fn=generate_narrative,
     )
 
-    return AgentResult(
-        narrative=narrative,
-        validation=validation,
-        trace=trace,
+    result = AgentResult(
+        narrative=narrative, validation=validation, trace=trace,
         collected=collected,
         query_type=collected.get("query_type", query_type_hint),
-        iterations=iteration,
-        stop_reason=stop_reason,
-        rationale=rationale,
+        iterations=iteration, stop_reason=stop_reason, rationale=rationale,
     )
+    result.trace_path = _persist_trace(query, result.query_type, messages, trace, result)
+    return result

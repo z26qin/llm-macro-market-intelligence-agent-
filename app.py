@@ -21,6 +21,8 @@ from services.fear_greed import get_cnn_fear_greed, get_crypto_fear_greed, FearG
 from services.classifier import classify_query, ClassificationResult
 from services.agent import run_agent, AgentResult, AgentTrace
 from services.llm import is_llm_available
+from services.fred import fetch_default_panel, FredSeries
+from services.cot import fetch_default_panel as fetch_cot_panel, CotSnapshot
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Orchestrator
@@ -115,16 +117,17 @@ analysis_tab = html.Div(
             ]),
             html.Button(
                 "Run Analysis", id="run-btn",
+                title="Agent path when vLLM is available; falls back to the linear orchestrator otherwise.",
                 style={"padding": "8px 20px", "fontSize": "14px",
                        "cursor": "pointer", "backgroundColor": "#222",
                        "color": "#fff", "border": "none", "borderRadius": "4px"},
             ),
             html.Button(
-                "Run with Agent 🤖", id="agent-btn",
-                title="Tool-calling ReAct loop (requires vLLM with tool-call support)",
-                style={"padding": "8px 20px", "fontSize": "14px",
-                       "cursor": "pointer", "backgroundColor": "#06c",
-                       "color": "#fff", "border": "none", "borderRadius": "4px"},
+                "Force Linear", id="linear-btn",
+                title="Skip the agent and use the fixed pipeline (debugging).",
+                style={"padding": "8px 16px", "fontSize": "12px",
+                       "cursor": "pointer", "backgroundColor": "#fff",
+                       "color": "#222", "border": "1px solid #888", "borderRadius": "4px"},
             ),
         ]),
 
@@ -243,6 +246,28 @@ fear_greed_tab = html.Div(
 )
 
 
+macro_tab = html.Div(
+    style={"paddingTop": "16px"},
+    children=[
+        html.Div(style={"display": "flex", "gap": "12px", "alignItems": "center",
+                        "marginBottom": "16px"}, children=[
+            html.Button(
+                "Refresh Macro", id="macro-btn",
+                style={"padding": "8px 20px", "fontSize": "14px",
+                       "cursor": "pointer", "backgroundColor": "#222",
+                       "color": "#fff", "border": "none", "borderRadius": "4px"},
+            ),
+            html.Span("Rates, dollar, vol, credit spreads, breakevens — sourced from FRED. "
+                      "Cached on disk for 6 hours.",
+                      style={"fontSize": "12px", "color": "#666"}),
+        ]),
+        dcc.Loading(id="macro-loading", type="default", children=[
+            html.Div(id="macro-output", style={"marginTop": "12px"}),
+        ]),
+    ],
+)
+
+
 app.layout = html.Div(
     style={"fontFamily": "Menlo, Consolas, monospace", "maxWidth": "1152px",
            "margin": "0 auto", "padding": "24px"},
@@ -252,6 +277,7 @@ app.layout = html.Div(
         dcc.Tabs(id="main-tabs", value="analysis", children=[
             dcc.Tab(label="Analysis", value="analysis", children=[analysis_tab]),
             dcc.Tab(label="Technicals", value="technicals", children=[technicals_tab]),
+            dcc.Tab(label="Macro", value="macro", children=[macro_tab]),
             dcc.Tab(label="Portfolio Construction", value="portfolio", children=[portfolio_tab]),
             dcc.Tab(label="Fear & Greed", value="fear_greed", children=[fear_greed_tab]),
         ]),
@@ -534,6 +560,15 @@ def _run_agent_path(query: str, query_type_hint: str) -> html.Div:
     if agent.collected.get("snapshots"):
         components.append(_render_prices(agent.collected["snapshots"]))
         components.append(html.Hr())
+    if agent.collected.get("macro_panel") or agent.collected.get("macro"):
+        components.append(_render_agent_macro(agent.collected))
+        components.append(html.Hr())
+    if agent.collected.get("positioning_panel") or agent.collected.get("positioning"):
+        components.append(_render_agent_positioning(agent.collected))
+        components.append(html.Hr())
+    if agent.collected.get("options_iv"):
+        components.append(_render_agent_options_iv(agent.collected["options_iv"]))
+        components.append(html.Hr())
     if agent.collected.get("credit_spreads"):
         components.append(_render_credit_spreads(agent.collected["credit_spreads"]))
         components.append(html.Hr())
@@ -548,7 +583,104 @@ def _run_agent_path(query: str, query_type_hint: str) -> html.Div:
         html.Hr(),
         _render_validation(agent.validation),
     ])
+    if agent.trace_path:
+        components.append(html.P(f"Trace persisted: {agent.trace_path}",
+                                  style={"fontSize": "11px", "color": "#888",
+                                         "marginTop": "8px", "fontFamily": "Menlo, monospace"}))
     return html.Div(components)
+
+
+def _render_agent_macro(collected: dict) -> html.Div:
+    panel = collected.get("macro_panel") or list((collected.get("macro") or {}).values())
+    rows = []
+    for s in panel:
+        if getattr(s, "error", None) or not getattr(s, "latest", None):
+            rows.append(html.Tr([
+                html.Td(f"{s.name} ({s.series_id})", style={"fontWeight": "bold"}),
+                html.Td(s.error or "no data", colSpan=3,
+                         style={"color": "#999", "fontStyle": "italic"}),
+            ]))
+            continue
+        date, val = s.latest
+        chg5 = s.change(5)
+        chg5_str = f"{chg5:+.2f}" if chg5 is not None else "—"
+        c5 = "#080" if (chg5 or 0) >= 0 else "#b00"
+        rows.append(html.Tr([
+            html.Td(f"{s.name} ({s.series_id})", style={"fontWeight": "bold"}),
+            html.Td(f"{val:.2f} {s.units}".strip()),
+            html.Td(date, style={"fontSize": "11px", "color": "#666"}),
+            html.Td(chg5_str, style={"color": c5}),
+        ]))
+    header = html.Tr([html.Th("Series"), html.Th("Latest"), html.Th("As of"), html.Th("5d Δ")])
+    return html.Div([
+        html.H4("Macro Backdrop (FRED)"),
+        html.Table([header] + rows,
+                    style={"borderCollapse": "collapse", "width": "100%",
+                           "fontSize": "13px", "textAlign": "left"}),
+    ], style={"overflowX": "auto"})
+
+
+def _render_agent_positioning(collected: dict) -> html.Div:
+    panel = collected.get("positioning_panel") or list((collected.get("positioning") or {}).values())
+    rows = []
+    for s in panel:
+        if getattr(s, "error", None) or s.net_noncomm is None:
+            rows.append(html.Tr([
+                html.Td(f"{s.name} ({s.code})", style={"fontWeight": "bold"}),
+                html.Td(s.error or "no data", colSpan=3,
+                         style={"color": "#999", "fontStyle": "italic"}),
+            ]))
+            continue
+        z_str = f"{s.z_score:+.2f}" if s.z_score is not None else "—"
+        flag = ""
+        z_color = "#666"
+        if s.z_score is not None and s.z_score >= 2.0:
+            z_color, flag = "#b00", " crowded long"
+        elif s.z_score is not None and s.z_score <= -2.0:
+            z_color, flag = "#b00", " crowded short"
+        rows.append(html.Tr([
+            html.Td(f"{s.name} ({s.code})", style={"fontWeight": "bold"}),
+            html.Td(s.report_date, style={"fontSize": "11px", "color": "#666"}),
+            html.Td(f"{s.net_noncomm:+,}"),
+            html.Td([z_str, html.Span(flag, style={"fontSize": "11px"})],
+                     style={"color": z_color, "fontWeight": "bold" if flag else "normal"}),
+        ]))
+    header = html.Tr([html.Th("Market"), html.Th("As of"),
+                       html.Th("Net spec"), html.Th("z (52w)")])
+    return html.Div([
+        html.H4("Speculator Positioning (CFTC COT)"),
+        html.Table([header] + rows,
+                    style={"borderCollapse": "collapse", "width": "100%",
+                           "fontSize": "13px", "textAlign": "left"}),
+    ], style={"overflowX": "auto"})
+
+
+def _render_agent_options_iv(iv_map: dict) -> html.Div:
+    rows = []
+    for ticker, s in iv_map.items():
+        if getattr(s, "error", None):
+            rows.append(html.Tr([
+                html.Td(ticker, style={"fontWeight": "bold"}),
+                html.Td(s.error, colSpan=4,
+                         style={"color": "#999", "fontStyle": "italic"}),
+            ]))
+            continue
+        avg = f"{s.avg_iv*100:.1f}%" if s.avg_iv is not None else "—"
+        rows.append(html.Tr([
+            html.Td(ticker, style={"fontWeight": "bold"}),
+            html.Td(f"${s.spot:.2f}" if s.spot else "—"),
+            html.Td(s.expiry or "—"),
+            html.Td(f"{s.days_to_expiry}d" if s.days_to_expiry is not None else "—"),
+            html.Td(avg),
+        ]))
+    header = html.Tr([html.Th("Ticker"), html.Th("Spot"), html.Th("Expiry"),
+                       html.Th("DTE"), html.Th("ATM IV (avg)")])
+    return html.Div([
+        html.H4("Options Implied Volatility"),
+        html.Table([header] + rows,
+                    style={"borderCollapse": "collapse", "width": "100%",
+                           "fontSize": "13px", "textAlign": "left"}),
+    ], style={"overflowX": "auto"})
 
 
 def _render_agent_trace(agent_result: AgentResult) -> html.Div:
@@ -624,22 +756,26 @@ def _render_debug(results: list[SearchResult], sentiment: SentimentSummary):
 @callback(
     Output("output-area", "children"),
     Input("run-btn", "n_clicks"),
-    Input("agent-btn", "n_clicks"),
+    Input("linear-btn", "n_clicks"),
     State("query-input", "value"),
     State("query-type", "value"),
     prevent_initial_call=True,
 )
-def on_run(run_clicks, agent_clicks, query, query_type):
+def on_run(run_clicks, linear_clicks, query, query_type):
     if not query:
         return html.P("Enter a query above.", style={"color": "#999"})
 
-    # Dispatch to whichever button fired
     trigger = dash.callback_context.triggered[0]["prop_id"].split(".")[0] if dash.callback_context.triggered else "run-btn"
+    forced_linear = trigger == "linear-btn"
 
-    if trigger == "agent-btn":
-        return _run_agent_path(query, query_type)
+    # Default: agent path when vLLM is available; otherwise fall back to linear.
+    if not forced_linear and is_llm_available():
+        try:
+            return _run_agent_path(query, query_type)
+        except Exception as e:
+            print(f"[app] agent path failed, falling back to linear: {e}")
 
-    # Query classifier agent (Step 2): when type is "auto", let the LLM pick.
+    # Linear fallback (or forced).
     classification: ClassificationResult | None = None
     if query_type == "auto":
         classification = classify_query(query)
@@ -1041,5 +1177,142 @@ def on_load_fear_greed(n_clicks):
     )
 
 
+SPARKLINE_SERIES = {"DGS10", "T10Y2Y", "DTWEXBGS", "VIXCLS", "BAMLH0A0HYM2"}
+
+
+def _spark(series: FredSeries) -> dcc.Graph | html.Span:
+    if not series.observations:
+        return html.Span("—", style={"color": "#999"})
+    xs = [d for d, _ in series.observations[-60:]]
+    ys = [v for _, v in series.observations[-60:]]
+    color = "#080" if ys[-1] >= ys[0] else "#b00"
+    fig = go.Figure(go.Scatter(x=xs, y=ys, mode="lines", line={"color": color, "width": 1.5}))
+    fig.update_layout(
+        margin={"l": 0, "r": 0, "t": 0, "b": 0},
+        height=40, width=140,
+        xaxis={"visible": False},
+        yaxis={"visible": False},
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return dcc.Graph(figure=fig, config={"displayModeBar": False},
+                      style={"width": "140px", "height": "40px"})
+
+
+def _render_macro_panel(panel: list[FredSeries]) -> html.Div:
+    if all(s.error for s in panel):
+        return html.Div([
+            html.P("FRED data unavailable. Set FRED_API_KEY in .env.",
+                    style={"color": "#b00"}),
+        ])
+
+    rows = []
+    for s in panel:
+        if s.error or not s.latest:
+            rows.append(html.Tr([
+                html.Td(f"{s.name} ({s.series_id})", style={"fontWeight": "bold"}),
+                html.Td(s.error or "no data", colSpan=5,
+                         style={"color": "#999", "fontStyle": "italic"}),
+            ]))
+            continue
+
+        date, val = s.latest
+        chg5 = s.change(5)
+        chg20 = s.change(20)
+        chg5_str = f"{chg5:+.2f}" if chg5 is not None else "—"
+        chg20_str = f"{chg20:+.2f}" if chg20 is not None else "—"
+        c5 = "#080" if (chg5 or 0) >= 0 else "#b00"
+        c20 = "#080" if (chg20 or 0) >= 0 else "#b00"
+        spark = _spark(s) if s.series_id in SPARKLINE_SERIES else html.Span("")
+
+        rows.append(html.Tr([
+            html.Td(f"{s.name} ({s.series_id})", style={"fontWeight": "bold"}),
+            html.Td(f"{val:.2f} {s.units}".strip()),
+            html.Td(date, style={"fontSize": "11px", "color": "#666"}),
+            html.Td(chg5_str, style={"color": c5}),
+            html.Td(chg20_str, style={"color": c20}),
+            html.Td(spark),
+        ]))
+
+    header = html.Tr([
+        html.Th("Series"), html.Th("Latest"), html.Th("As of"),
+        html.Th("5d Δ"), html.Th("20d Δ"), html.Th("60d sparkline"),
+    ])
+    return html.Div([
+        html.H4("Macro Backdrop"),
+        html.Table([header] + rows,
+                    style={"borderCollapse": "collapse", "width": "100%",
+                           "fontSize": "13px", "textAlign": "left"}),
+        html.P("Δ values are absolute (percentage points for rates/spreads, "
+                "index points for DXY/VIX, $ for crude).",
+                style={"fontSize": "11px", "color": "#888", "marginTop": "8px"}),
+    ], style={"overflowX": "auto"})
+
+
+def _render_cot_panel(panel: list[CotSnapshot]) -> html.Div:
+    if all(s.error for s in panel):
+        return html.Div([
+            html.P("CFTC COT data unavailable.", style={"color": "#b00"}),
+        ])
+
+    rows = []
+    for s in panel:
+        if s.error or s.net_noncomm is None:
+            rows.append(html.Tr([
+                html.Td(f"{s.name} ({s.code})", style={"fontWeight": "bold"}),
+                html.Td(s.error or "no data", colSpan=4,
+                         style={"color": "#999", "fontStyle": "italic"}),
+            ]))
+            continue
+
+        wc_str = f"{s.week_change:+,}" if s.week_change is not None else "—"
+        wc_color = "#080" if (s.week_change or 0) >= 0 else "#b00"
+        z_str = f"{s.z_score:+.2f}" if s.z_score is not None else "—"
+        z_color = "#666"
+        flag = ""
+        if s.z_score is not None and s.z_score >= 2.0:
+            z_color, flag = "#b00", "  crowded long"
+        elif s.z_score is not None and s.z_score <= -2.0:
+            z_color, flag = "#b00", "  crowded short"
+
+        rows.append(html.Tr([
+            html.Td(f"{s.name} ({s.code})", style={"fontWeight": "bold"}),
+            html.Td(s.report_date, style={"fontSize": "11px", "color": "#666"}),
+            html.Td(f"{s.net_noncomm:+,}"),
+            html.Td(wc_str, style={"color": wc_color}),
+            html.Td([z_str, html.Span(flag, style={"color": z_color, "fontSize": "11px"})],
+                     style={"color": z_color, "fontWeight": "bold" if flag else "normal"}),
+        ]))
+
+    header = html.Tr([
+        html.Th("Market"), html.Th("As of"), html.Th("Net spec"),
+        html.Th("Δ wk"), html.Th("z (52w)"),
+    ])
+    return html.Div([
+        html.H4("Speculator Positioning (CFTC COT)", style={"marginTop": "24px"}),
+        html.Table([header] + rows,
+                    style={"borderCollapse": "collapse", "width": "100%",
+                           "fontSize": "13px", "textAlign": "left"}),
+        html.P("Net spec = leveraged-fund (financials) or non-commercial (commodities) "
+                "long − short. z-score vs trailing 52 weeks; |z|≥2 flagged as crowded.",
+                style={"fontSize": "11px", "color": "#888", "marginTop": "8px"}),
+    ], style={"overflowX": "auto"})
+
+
+@callback(
+    Output("macro-output", "children"),
+    Input("macro-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def on_load_macro(n_clicks):
+    fred_panel = fetch_default_panel()
+    cot_panel = fetch_cot_panel()
+    return html.Div([
+        _render_macro_panel(fred_panel),
+        _render_cot_panel(cot_panel),
+    ])
+
+
 if __name__ == "__main__":
-    app.run(debug=True, port=8050)
+    app.run(debug=True, port=8051)

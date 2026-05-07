@@ -20,6 +20,8 @@ from services.market_data import PriceSnapshot
 from services.search import SearchResult
 from services.sentiment import SentimentSummary  # noqa: F401 — used in type hints below
 from services.validation import validate_narrative, ValidationResult
+from services.fred import macro_summary_lines
+from services.cot import positioning_summary_lines
 
 
 DEFAULT_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
@@ -70,11 +72,27 @@ def _format_sentiment(sentiment: SentimentSummary) -> str:
     )
 
 
+def _format_macro_context(lines: list[str]) -> str:
+    """Format FRED macro snapshot lines for the prompt."""
+    if not lines:
+        return "No macro data available."
+    return "\n".join(lines)
+
+
+def _format_positioning(lines: list[str]) -> str:
+    """Format CFTC COT positioning lines for the prompt."""
+    if not lines:
+        return "No positioning data available."
+    return "\n".join(lines)
+
+
 def _build_prompt(
     topic: str,
     price_data: str,
     headlines: str,
     sentiment_summary: str,
+    macro_context: str,
+    positioning: str,
 ) -> str:
     """Build the prompt for the LLM with citation enforcement and uncertainty quantification."""
     return f"""You are a macro market analyst. Your task is to explain today's market moves using ONLY the provided evidence.
@@ -84,6 +102,8 @@ CRITICAL REQUIREMENTS:
 2. USE EXACT NUMBERS: When mentioning price changes, use the exact percentages from the market data
 3. QUANTIFY CONFIDENCE: Rate your confidence for each section (HIGH/MEDIUM/LOW)
 4. NO SPECULATION: If evidence is insufficient, state "INSUFFICIENT DATA" instead of guessing
+5. MACRO BACKDROP: When invoking rates, dollar, vol, or credit conditions, cite the FRED series id (e.g., [DGS10], [VIXCLS]) instead of [Source N].
+6. POSITIONING: When invoking speculator positioning, cite the COT market code in brackets (e.g., [COT_CL], [COT_ES]). Z-scores ≥ |2| signal crowded positioning.
 
 Available evidence:
 
@@ -95,6 +115,12 @@ News sources (cite as [Source N]):
 
 Sentiment summary:
 {sentiment_summary}
+
+Macro backdrop (FRED, cite by series id):
+{macro_context}
+
+Speculator positioning (CFTC COT, cite by market code e.g. [COT_CL]):
+{positioning}
 
 Generate a structured analysis with these sections:
 
@@ -151,12 +177,16 @@ def generate_market_narrative(
     formatted_prices = _format_price_data(price_data.get("snapshots", []))
     formatted_headlines = _format_headlines(headlines)
     formatted_sentiment = _format_sentiment(sentiment_summary)
+    formatted_macro = _format_macro_context(macro_summary_lines())
+    formatted_positioning = _format_positioning(positioning_summary_lines())
 
     prompt = _build_prompt(
         topic=topic,
         price_data=formatted_prices,
         headlines=formatted_headlines,
         sentiment_summary=formatted_sentiment,
+        macro_context=formatted_macro,
+        positioning=formatted_positioning,
     )
 
     headers = {"Content-Type": "application/json"}
@@ -203,6 +233,8 @@ def _build_correction_prompt(
     price_data: str,
     headlines: str,
     sentiment_summary: str,
+    macro_context: str,
+    positioning: str,
     previous_narrative: str,
     validation: ValidationResult,
 ) -> str:
@@ -242,6 +274,12 @@ News sources (cite as [Source N], N must be valid):
 
 Sentiment summary:
 {sentiment_summary}
+
+Macro backdrop (FRED, cite by series id e.g. [DGS10]):
+{macro_context}
+
+Speculator positioning (CFTC COT, cite e.g. [COT_CL]):
+{positioning}
 
 Rewrite the analysis using the same 4-section structure:
 1. MOVE SUMMARY (Confidence: HIGH/MEDIUM/LOW)
@@ -329,6 +367,8 @@ def generate_and_validate_narrative(
     price_block = _format_price_data(snapshots)
     headlines_block = _format_headlines(results)
     sentiment_block = _format_sentiment(sentiment)
+    macro_block = _format_macro_context(macro_summary_lines())
+    positioning_block = _format_positioning(positioning_summary_lines())
 
     # Track best result across attempts so a worse retry can't overwrite a better original
     best_narrative, best_validation = narrative, validation
@@ -341,6 +381,7 @@ def generate_and_validate_narrative(
         attempt += 1
         correction_prompt = _build_correction_prompt(
             topic, price_block, headlines_block, sentiment_block,
+            macro_block, positioning_block,
             previous_narrative=narrative, validation=validation,
         )
         try:

@@ -61,6 +61,7 @@ Open http://localhost:8050.
 | Variable | Required | Description |
 |---|---|---|
 | `TAVILY_API_KEY` | Yes (for live search) | API key from [tavily.com](https://tavily.com) |
+| `FRED_API_KEY` | No | API key from [fredaccount.stlouisfed.org](https://fredaccount.stlouisfed.org) — enables macro backdrop (rates, DXY, VIX, HY OAS) in the narrative |
 | `VLLM_ENDPOINT` | No | vLLM server URL (e.g. `http://localhost:8000`) |
 | `VLLM_API_KEY` | No | Auth key if vLLM server requires it |
 | `VLLM_MODEL` | No | Model name (default: `meta-llama/Llama-3.3-70B-Instruct`) |
