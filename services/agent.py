@@ -180,8 +180,26 @@ def _redact_messages(messages: list[dict]) -> list[dict]:
 # Loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_agent(query: str, query_type_hint: str = "macro") -> AgentResult:
-    """Run the tool-calling agent. Raises if vLLM is unavailable."""
+def run_agent(
+    query: str,
+    query_type_hint: str = "macro",
+    on_step: Any = None,
+) -> AgentResult:
+    """Run the tool-calling agent. Raises if vLLM is unavailable.
+
+    `on_step(trace_entry, all_so_far)` is invoked after each tool execution and
+    after the final narrative is generated. Use it to stream progress to a UI.
+    Errors raised by the callback are swallowed so they can't kill the loop.
+    """
+
+    def _emit(entry: AgentTrace | None, trace_so_far: list[AgentTrace],
+                stage: str = "tool") -> None:
+        if on_step is None:
+            return
+        try:
+            on_step(entry, trace_so_far, stage)
+        except Exception as e:
+            print(f"[agent] on_step callback raised: {e}")
     if not is_llm_available():
         raise RuntimeError(
             "Agent mode requires VLLM_ENDPOINT with tool-calling support "
@@ -243,14 +261,16 @@ def run_agent(query: str, query_type_hint: str = "macro") -> AgentResult:
                         result = {"error": f"{type(e).__name__}: {e}"}
                 duration_ms = int((time.time() - start) * 1000)
 
-            trace.append(AgentTrace(tool=name, args=args,
-                                      summary=_truncate(result), duration_ms=duration_ms))
+            entry = AgentTrace(tool=name, args=args,
+                                 summary=_truncate(result), duration_ms=duration_ms)
+            trace.append(entry)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.get("id", ""),
                 "name": name,
                 "content": json.dumps(result, default=str)[:1500],
             })
+            _emit(entry, trace, stage="tool")
 
             if name == "finalize":
                 finalized = True
@@ -260,6 +280,7 @@ def run_agent(query: str, query_type_hint: str = "macro") -> AgentResult:
             stop_reason = "finalized"
             break
 
+    _emit(None, trace, stage="narrating")
     narrative, validation = generate_and_validate_narrative(
         topic=query,
         query_type=collected.get("query_type", query_type_hint),
@@ -268,6 +289,7 @@ def run_agent(query: str, query_type_hint: str = "macro") -> AgentResult:
         sentiment=collected.get("sentiment") or analyze_sentiment([]),
         template_fallback_fn=generate_narrative,
     )
+    _emit(None, trace, stage="done")
 
     result = AgentResult(
         narrative=narrative, validation=validation, trace=trace,

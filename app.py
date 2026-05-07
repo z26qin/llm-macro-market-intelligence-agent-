@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import dash
-from dash import dcc, html, Input, Output, State, callback, dash_table
+from dash import dcc, html, Input, Output, State, callback, dash_table, DiskcacheManager
+import diskcache
 import plotly.graph_objects as go
 
 from services.search import search_tavily, SearchResult
@@ -79,7 +80,9 @@ def run_analysis(query: str, query_type: str) -> dict:
 # Dash App
 # ═══════════════════════════════════════════════════════════════════════════════
 
-app = dash.Dash(__name__)
+_dash_cache = diskcache.Cache(".cache/dash")
+_bg_manager = DiskcacheManager(_dash_cache)
+app = dash.Dash(__name__, background_callback_manager=_bg_manager)
 app.title = "Macro Market Intelligence"
 
 analysis_tab = html.Div(
@@ -131,7 +134,10 @@ analysis_tab = html.Div(
             ),
         ]),
 
-        # ── Loading + output ─────────────────────────────────────────────
+        # ── Live agent trace (streamed) ──────────────────────────────────
+        html.Div(id="agent-progress", style={"marginTop": "12px"}),
+
+        # ── Final output ─────────────────────────────────────────────────
         dcc.Loading(id="loading", type="default", children=[
             html.Div(id="output-area", style={"marginTop": "12px"}),
         ]),
@@ -535,8 +541,8 @@ def _render_classification(c: ClassificationResult) -> html.Div:
               "borderLeft": "3px solid #06c", "borderRadius": "4px"})
 
 
-def _run_agent_path(query: str, query_type_hint: str) -> html.Div:
-    """Agent-mode dispatch: tool-calling ReAct loop (Step 3)."""
+def _run_agent_path(query: str, query_type_hint: str, set_progress=None) -> html.Div:
+    """Agent-mode dispatch: tool-calling ReAct loop (streamed when set_progress is given)."""
     hint = query_type_hint if query_type_hint != "auto" else "macro"
     if not is_llm_available():
         return html.Div([
@@ -546,8 +552,19 @@ def _run_agent_path(query: str, query_type_hint: str) -> html.Div:
                    "`--enable-auto-tool-choice --tool-call-parser llama3_json`.",
                    style={"fontSize": "12px", "color": "#666"}),
         ])
+
+    # Wipe any prior run's trace immediately so the user sees fresh activity
+    if set_progress is not None:
+        set_progress(_render_live_trace([], stage="thinking"))
+
+    # Streaming hook: each tool call updates `agent-progress` in real time.
+    def _on_step(entry, trace_so_far, stage):
+        if set_progress is None:
+            return
+        set_progress(_render_live_trace(trace_so_far, stage))
+
     try:
-        agent = run_agent(query, query_type_hint=hint)
+        agent = run_agent(query, query_type_hint=hint, on_step=_on_step)
     except Exception as e:
         return html.Div([
             html.P(f"Agent failed: {e}", style={"color": "#b00"}),
@@ -683,6 +700,42 @@ def _render_agent_options_iv(iv_map: dict) -> html.Div:
     ], style={"overflowX": "auto"})
 
 
+def _render_live_trace(trace_so_far: list, stage: str) -> html.Div:
+    """Compact live view of the agent's progress; rendered each on_step tick."""
+    items = []
+    for i, step in enumerate(trace_so_far, 1):
+        items.append(html.Div([
+            html.Span(f"{i}. ", style={"color": "#888"}),
+            html.Span(step.tool, style={"fontWeight": "bold", "color": "#06c",
+                                          "fontFamily": "Menlo, monospace"}),
+            html.Span(f"  ({step.duration_ms} ms)",
+                       style={"fontSize": "11px", "color": "#888",
+                              "fontFamily": "Menlo, monospace"}),
+            html.Div(f"→ {step.summary}",
+                     style={"fontSize": "11px", "color": "#666", "marginLeft": "20px",
+                            "fontFamily": "Menlo, monospace"}),
+        ], style={"padding": "2px 0"}))
+
+    if stage == "narrating":
+        items.append(html.Div("✎ generating narrative…",
+                                style={"padding": "4px 0", "color": "#06c",
+                                       "fontStyle": "italic", "fontFamily": "Menlo, monospace"}))
+    elif stage == "done":
+        items.append(html.Div("✓ done", style={"padding": "4px 0", "color": "#080",
+                                                  "fontFamily": "Menlo, monospace"}))
+    else:
+        items.append(html.Div("⏱ thinking…",
+                                style={"padding": "4px 0", "color": "#888",
+                                       "fontStyle": "italic", "fontFamily": "Menlo, monospace"}))
+
+    return html.Div([
+        html.Div("🤖 Agent activity", style={"fontWeight": "bold", "fontSize": "13px",
+                                                "marginBottom": "6px"}),
+        html.Div(items, style={"backgroundColor": "#fafafa", "padding": "10px 14px",
+                                 "borderRadius": "4px", "border": "1px solid #eee"}),
+    ], style={"marginBottom": "12px"})
+
+
 def _render_agent_trace(agent_result: AgentResult) -> html.Div:
     """Render the tool-calling agent's reasoning trace (Step 3)."""
     reason_color = {
@@ -759,10 +812,13 @@ def _render_debug(results: list[SearchResult], sentiment: SentimentSummary):
     Input("linear-btn", "n_clicks"),
     State("query-input", "value"),
     State("query-type", "value"),
+    background=True,
+    progress=Output("agent-progress", "children"),
     prevent_initial_call=True,
 )
-def on_run(run_clicks, linear_clicks, query, query_type):
+def on_run(set_progress, run_clicks, linear_clicks, query, query_type):
     if not query:
+        set_progress(html.Div())
         return html.P("Enter a query above.", style={"color": "#999"})
 
     trigger = dash.callback_context.triggered[0]["prop_id"].split(".")[0] if dash.callback_context.triggered else "run-btn"
@@ -771,9 +827,14 @@ def on_run(run_clicks, linear_clicks, query, query_type):
     # Default: agent path when vLLM is available; otherwise fall back to linear.
     if not forced_linear and is_llm_available():
         try:
-            return _run_agent_path(query, query_type)
+            return _run_agent_path(query, query_type, set_progress=set_progress)
         except Exception as e:
             print(f"[app] agent path failed, falling back to linear: {e}")
+            set_progress(html.Div(f"Agent path failed: {e} — falling back to linear.",
+                                    style={"color": "#b00", "fontSize": "12px"}))
+
+    # Linear path has no live trace
+    set_progress(html.Div())
 
     # Linear fallback (or forced).
     classification: ClassificationResult | None = None

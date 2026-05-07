@@ -89,7 +89,8 @@ def _restore_tools(originals):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_with_script(script: list[dict], query: str = "NVDA",
-                      query_type_hint: str = "ticker", trace_dir: str | None = None):
+                      query_type_hint: str = "ticker", trace_dir: str | None = None,
+                      on_step=None):
     """Run the agent with a scripted vLLM response sequence."""
     seq = list(script)
 
@@ -106,10 +107,10 @@ def _run_with_script(script: list[dict], query: str = "NVDA",
                 old = agent_mod.TRACE_DIR
                 agent_mod.TRACE_DIR = trace_dir
                 try:
-                    return run_agent(query, query_type_hint=query_type_hint)
+                    return run_agent(query, query_type_hint=query_type_hint, on_step=on_step)
                 finally:
                     agent_mod.TRACE_DIR = old
-            return run_agent(query, query_type_hint=query_type_hint)
+            return run_agent(query, query_type_hint=query_type_hint, on_step=on_step)
     finally:
         _restore_tools(originals)
 
@@ -185,6 +186,42 @@ def test_max_iters_capped(tmp_dir: Path):
     assert len(result.trace) == agent_mod.MAX_AGENT_ITERATIONS
 
 
+def test_on_step_receives_each_tool_and_finalize(tmp_dir: Path):
+    """on_step must fire after each tool, then once for narrating, once for done."""
+    events: list[tuple[str, str | None]] = []
+
+    def cb(entry, trace_so_far, stage):
+        tool = entry.tool if entry is not None else None
+        events.append((stage, tool))
+
+    script = [
+        _resp(tool_calls=[_tc("get_prices", {"query": "NVDA", "query_type": "ticker"}, "c1")]),
+        _resp(tool_calls=[_tc("get_macro_panel", {}, "c2")]),
+        _resp(tool_calls=[_tc("finalize", {"rationale": "ok"}, "c3")]),
+    ]
+    result = _run_with_script(script, trace_dir=str(tmp_dir), on_step=cb)
+    assert result.stop_reason == "finalized"
+
+    stages = [s for s, _ in events]
+    tools = [t for _, t in events]
+    assert stages == ["tool", "tool", "tool", "narrating", "done"], stages
+    assert tools == ["get_prices", "get_macro_panel", "finalize", None, None], tools
+
+
+def test_on_step_failure_does_not_break_loop(tmp_dir: Path):
+    """A buggy on_step callback must be swallowed so the agent finishes."""
+    def bad_cb(*_a, **_kw):
+        raise RuntimeError("ui crashed")
+
+    script = [
+        _resp(tool_calls=[_tc("get_prices", {"query": "X", "query_type": "ticker"}, "c1")]),
+        _resp(tool_calls=[_tc("finalize", {"rationale": "ok"}, "c2")]),
+    ]
+    result = _run_with_script(script, trace_dir=str(tmp_dir), on_step=bad_cb)
+    assert result.stop_reason == "finalized"
+    assert len(result.trace) == 2
+
+
 def test_unknown_tool_returns_error(tmp_dir: Path):
     script = [
         _resp(tool_calls=[_tc("nonexistent_tool", {}, "c1")]),
@@ -204,6 +241,8 @@ TESTS = [
     test_no_more_tools_stops,
     test_duplicate_call_refused,
     test_max_iters_capped,
+    test_on_step_receives_each_tool_and_finalize,
+    test_on_step_failure_does_not_break_loop,
     test_unknown_tool_returns_error,
 ]
 
