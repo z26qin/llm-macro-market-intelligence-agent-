@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import dash
 from dash import callback, Input, Output, State, html
 
@@ -23,6 +26,7 @@ from ui.renderers import (
     _render_live_trace, _render_agent_trace,
     _render_technicals, _render_portfolio,
     _render_fg_panel, _render_macro_panel, _render_cot_panel,
+    _render_trace_summary, _render_trace_steps,
 )
 
 
@@ -216,3 +220,82 @@ def on_load_macro(n_clicks):
         _render_macro_panel(fetch_fred_panel()),
         _render_cot_panel(fetch_cot_panel()),
     ])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Traces tab
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _trace_files() -> list:
+    d = Path(".cache/agent_traces")
+    if not d.exists():
+        return []
+    return sorted(d.glob("*.json"), reverse=True)
+
+
+def _trace_label(meta: dict, path: Path) -> str:
+    ts = path.stem.split("_", 1)[0] if "_" in path.stem else path.stem
+    qt = meta.get("query_type", "?")
+    q = (meta.get("query") or "").strip().replace("\n", " ")
+    if len(q) > 60:
+        q = q[:57] + "…"
+    stop = meta.get("stop_reason", "?")
+    return f"{ts}  [{qt}]  {q}  ({stop})"
+
+
+@callback(
+    Output("trace-select", "options"),
+    Output("trace-select", "value"),
+    Input("trace-refresh-btn", "n_clicks"),
+    Input("main-tabs", "value"),
+)
+def on_trace_refresh(n_clicks, active_tab):
+    if active_tab != "traces" and not n_clicks:
+        return [], None
+    options = []
+    for f in _trace_files():
+        try:
+            meta = json.loads(f.read_text())
+        except Exception:
+            meta = {}
+        options.append({"label": _trace_label(meta, f), "value": str(f)})
+    return options, None
+
+
+@callback(
+    Output("trace-detail", "children"),
+    Input("trace-select", "value"),
+    prevent_initial_call=True,
+)
+def on_trace_selected(path):
+    if not path:
+        return html.Div()
+    p = Path(path)
+    if not p.exists():
+        return html.P(f"Trace file no longer exists: {path}", style={"color": "#b00"})
+    try:
+        d = json.loads(p.read_text())
+    except Exception as e:
+        return html.P(f"Failed to parse trace: {e}", style={"color": "#b00"})
+
+    children = [_render_trace_summary(d)]
+    if d.get("trace"):
+        children.append(_render_trace_steps(d["trace"]))
+    if d.get("narrative"):
+        children.append(html.Details([
+            html.Summary("Narrative", style={"cursor": "pointer",
+                                              "fontWeight": "bold", "fontSize": "13px"}),
+            html.Pre(d["narrative"],
+                     style={"fontSize": "12px", "backgroundColor": "#fafafa",
+                            "padding": "12px", "border": "1px solid #eee",
+                            "whiteSpace": "pre-wrap", "wordBreak": "break-word"}),
+        ], open=True, style={"marginBottom": "16px"}))
+    children.append(html.Details([
+        html.Summary("Raw JSON", style={"cursor": "pointer",
+                                          "fontWeight": "bold", "fontSize": "13px"}),
+        html.Pre(json.dumps(d, indent=2),
+                 style={"fontSize": "11px", "backgroundColor": "#fafafa",
+                        "padding": "12px", "border": "1px solid #eee",
+                        "maxHeight": "400px", "overflowY": "auto"}),
+    ], style={"marginBottom": "16px"}))
+    return html.Div(children)

@@ -166,6 +166,32 @@ fear_greed_tab = html.Div(
 )
 
 
+traces_tab = html.Div(
+    style={"paddingTop": "16px"},
+    children=[
+        html.Div(style={"display": "flex", "gap": "12px", "alignItems": "center",
+                        "marginBottom": "12px"}, children=[
+            html.Button(
+                "Refresh List", id="trace-refresh-btn",
+                style={"padding": "6px 14px", "fontSize": "13px",
+                       "cursor": "pointer", "backgroundColor": "#222",
+                       "color": "#fff", "border": "none", "borderRadius": "4px"},
+            ),
+            html.Span("Persisted agent runs from .cache/agent_traces/. "
+                      "Generated automatically each time the agent path runs.",
+                      style={"fontSize": "12px", "color": "#666"}),
+        ]),
+        dcc.Dropdown(
+            id="trace-select",
+            placeholder="Select a trace…",
+            optionHeight=44,
+            style={"fontSize": "13px", "marginBottom": "16px"},
+        ),
+        html.Div(id="trace-detail"),
+    ],
+)
+
+
 macro_tab = html.Div(
     style={"paddingTop": "16px"},
     children=[
@@ -201,6 +227,7 @@ def root_layout() -> html.Div:
                 dcc.Tab(label="Macro", value="macro", children=[macro_tab]),
                 dcc.Tab(label="Portfolio Construction", value="portfolio", children=[portfolio_tab]),
                 dcc.Tab(label="Fear & Greed", value="fear_greed", children=[fear_greed_tab]),
+                dcc.Tab(label="Traces", value="traces", children=[traces_tab]),
             ]),
         ],
     )

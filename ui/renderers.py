@@ -882,3 +882,75 @@ def _render_cot_panel(panel: list[CotSnapshot]) -> html.Div:
     ], style={"overflowX": "auto"})
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Traces tab
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_trace_summary(d: dict) -> html.Div:
+    val = d.get("validation") or {}
+    passed_color = "#080" if val.get("passed") else "#b00"
+    stop_color = {
+        "finalized": "#080", "no_more_tools": "#c80", "max_iters": "#b00",
+    }.get(d.get("stop_reason", ""), "#666")
+    rows = [
+        ("Query", d.get("query", "")),
+        ("Type", d.get("query_type", "")),
+        ("Stop reason", html.Span(d.get("stop_reason", ""),
+                                    style={"color": stop_color, "fontWeight": "bold"})),
+        ("Iterations", str(d.get("iterations", "—"))),
+        ("Tool calls", str(len(d.get("trace") or []))),
+        ("Validation", html.Span(
+            f"passed={val.get('passed')}  conf={val.get('confidence_score')}",
+            style={"color": passed_color, "fontWeight": "bold"})),
+        ("Attempts", str(val.get("attempts") or "—")),
+        ("Rationale", d.get("rationale") or "—"),
+    ]
+    table_rows = [
+        html.Tr([
+            html.Td(k, style={"fontWeight": "bold", "padding": "3px 12px 3px 0",
+                               "verticalAlign": "top", "color": "#555",
+                               "fontSize": "12px"}),
+            html.Td(v, style={"fontSize": "12px"}),
+        ]) for k, v in rows
+    ]
+    return html.Div([
+        html.H4("Summary"),
+        html.Table(table_rows, style={"borderCollapse": "collapse"}),
+    ], style={"marginBottom": "16px"})
+
+
+def _render_trace_steps(steps: list[dict]) -> html.Div:
+    rows = []
+    for i, s in enumerate(steps, 1):
+        args_str = ", ".join(f"{k}={_truncate_arg(v)}"
+                                 for k, v in (s.get("args") or {}).items())
+        rows.append(html.Tr([
+            html.Td(str(i), style={"color": "#888", "padding": "4px 8px",
+                                     "verticalAlign": "top"}),
+            html.Td(s.get("tool", ""),
+                     style={"color": "#06c", "fontWeight": "bold",
+                            "fontFamily": "Menlo, monospace", "padding": "4px 8px",
+                            "verticalAlign": "top"}),
+            html.Td(args_str,
+                     style={"fontSize": "11px", "color": "#555",
+                            "fontFamily": "Menlo, monospace", "padding": "4px 8px",
+                            "verticalAlign": "top"}),
+            html.Td(f"{s.get('duration_ms', 0)} ms",
+                     style={"fontSize": "11px", "color": "#888", "padding": "4px 8px",
+                            "verticalAlign": "top"}),
+            html.Td(s.get("summary", ""),
+                     style={"fontSize": "11px", "color": "#666",
+                            "fontFamily": "Menlo, monospace", "padding": "4px 8px",
+                            "wordBreak": "break-all"}),
+        ]))
+    header = html.Tr([html.Th("#"), html.Th("Tool"), html.Th("Args"),
+                       html.Th("Latency"), html.Th("Result preview")])
+    return html.Div([
+        html.H4("Tool calls"),
+        html.Table([header] + rows,
+                    style={"borderCollapse": "collapse", "width": "100%",
+                           "fontSize": "12px", "textAlign": "left",
+                           "tableLayout": "fixed"}),
+    ], style={"overflowX": "auto", "marginBottom": "16px"})
