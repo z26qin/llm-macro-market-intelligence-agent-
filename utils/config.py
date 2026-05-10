@@ -6,6 +6,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
+FRED_API_KEY: str = os.getenv("FRED_API_KEY", "")
+FRED_CACHE_DIR: str = os.getenv("FRED_CACHE_DIR", ".cache/fred")
+FRED_CACHE_TTL_SECONDS: int = int(os.getenv("FRED_CACHE_TTL_SECONDS", "21600"))  # 6h default
+
+COT_CACHE_DIR: str = os.getenv("COT_CACHE_DIR", ".cache/cot")
+COT_CACHE_TTL_SECONDS: int = int(os.getenv("COT_CACHE_TTL_SECONDS", "86400"))  # 24h default; CFTC publishes weekly
 
 # Query type constants
 QUERY_OIL = "oil"
